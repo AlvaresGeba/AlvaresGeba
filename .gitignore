@@ -1,0 +1,6 @@
+.idea
+.venv
+certs/
+scripts/
+command_audit.log
+commands_whitelist.md
