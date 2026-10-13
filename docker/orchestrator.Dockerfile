@@ -3,11 +3,10 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 
-# ssh: run_command/run_script can target other cluster nodes over SSH.
-# curl: Claude Code installer.
-# procps: uptime / free (whitelist, get_system_status).
+# curl: Claude Code installer. No ssh/procps here: commands run in the
+# executor service, not in this container.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-client curl ca-certificates procps \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements-orchestrator.txt .
@@ -28,10 +27,10 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION}" \
 RUN mkdir -m 1777 /home/app
 ENV HOME=/home/app
 
-COPY gateway.py command_router.py mcp_command_server.py ./
+COPY gateway.py command_router.py ./
 
-# certs/, scripts/, commands_whitelist.md and the audit log are mounted at
-# runtime (see docker-compose.yml) - they never get baked into the image.
+# certs/ is mounted at runtime (see docker-compose.yml) - never baked into
+# the image.
 EXPOSE 8443
 # ~/.claude.json lives outside the mounted ~/.claude; without it Claude Code
 # prints a "configuration file not found" warning on every run.

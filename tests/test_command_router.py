@@ -13,15 +13,22 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 import command_router
+import mcp_command_server
 from command_router import MCP_CONFIG, handle_text_command
+
+SERVER_SCRIPT = Path(mcp_command_server.__file__)
 
 
 class McpConfigTests(unittest.TestCase):
-    def test_config_starts_mcp_server_with_cluster_tools(self) -> None:
-        server = MCP_CONFIG["mcpServers"]["cluster"]
+    def test_config_points_claude_at_executor_over_http(self) -> None:
+        self.assertEqual(
+            MCP_CONFIG["mcpServers"]["cluster"],
+            {"type": "http", "url": command_router.EXECUTOR_URL},
+        )
 
+    def test_server_exposes_cluster_tools(self) -> None:
         async def list_tools() -> set[str]:
-            params = StdioServerParameters(command=server["command"], args=server["args"])
+            params = StdioServerParameters(command=sys.executable, args=[str(SERVER_SCRIPT)])
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -31,6 +38,31 @@ class McpConfigTests(unittest.TestCase):
             anyio.run(list_tools),
             {"list_allowed_commands", "run_command", "run_script", "get_system_status"},
         )
+
+
+class ClassifyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        whitelist = Path(tmp.name) / "commands_whitelist.md"
+        whitelist.write_text(textwrap.dedent("""\
+            ```yaml
+            allow:
+              - pattern: '^df -h$'
+            deny:
+              - pattern: '^rm '
+            ```
+        """))
+        patcher = mock.patch.object(mcp_command_server, "WHITELIST_MD", whitelist)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_unmatched_command_is_refused(self) -> None:
+        self.assertEqual(mcp_command_server._classify("cat /etc/shadow")[0], "unknown")
+
+    def test_rules_still_apply(self) -> None:
+        self.assertEqual(mcp_command_server._classify("df -h")[0], "allow")
+        self.assertEqual(mcp_command_server._classify("rm -rf /")[0], "deny")
 
 
 class FakeClaude:

@@ -1,4 +1,5 @@
 # Everything, for local development and tests. Each container installs only
 # its own file.
 -r requirements-orchestrator.txt
+-r requirements-executor.txt
 -r requirements-stt.txt

@@ -1,8 +1,9 @@
 """
 gateway.py
 
-The only network-facing entry point. Everything else (MCP server, LLM
-router) only listens on localhost. This process terminates mutual-TLS
+The only network-facing entry point. Everything else (whisper, the
+executor's MCP server) is reachable only on internal docker networks. This
+process terminates mutual-TLS
 connections coming from the phone app over the VPN tunnel and forwards
 validated text commands into command_router.py.
 

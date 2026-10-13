@@ -1,0 +1,2 @@
+[v3_req]
+subjectAltName = IP:100.99.129.107,IP:127.0.0.1,DNS:cluster-gateway

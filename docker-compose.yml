@@ -1,9 +1,15 @@
-# whisper -> orchestrator -> claude
+# whisper -> orchestrator -> claude -> executor
 #
 # whisper      - speech-to-text (stt_service.py), internal network only
 # orchestrator - gateway.py (mTLS, the only exposed port) + command_router.py,
-#                which runs Claude Code headless; Claude talks to the server
-#                only through mcp_command_server.py's MCP tools
+#                which runs Claude Code headless. It cannot run commands
+#                itself: Claude only gets the executor's MCP tools.
+# executor     - mcp_command_server.py over HTTP, internal network only. The
+#                only container that runs commands; it checks every one
+#                against commands_whitelist.md.
+#
+# whisper and executor are on separate networks: each can talk only to the
+# orchestrator, not to each other.
 #
 # Claude uses the same login as `claude` in your terminal: your ~/.claude is
 # mounted into the orchestrator, which runs as your uid. Log in once on the
@@ -23,19 +29,43 @@ services:
     environment:
       GATEWAY_HOST: 0.0.0.0
       STT_URL: http://whisper:9000
+      EXECUTOR_URL: http://executor:8000/mcp
       CLAUDE_MODEL: ${CLAUDE_MODEL:-}
     ports:
       # Published on the VPN address only, as before.
       - "${GATEWAY_BIND:-100.99.129.107}:8443:8443"
     volumes:
       - ./certs:/app/certs:ro
-      - ./commands_whitelist.md:/app/commands_whitelist.md:ro
-      - ./scripts:/app/scripts:ro
-      - ./command_audit.log:/app/command_audit.log
       - ${HOME}/.claude:/home/app/.claude
+    networks: [default, stt, exec]
     depends_on:
       whisper:
         condition: service_healthy
+      executor:
+        condition: service_healthy
+
+  executor:
+    build:
+      context: .
+      dockerfile: docker/executor.Dockerfile
+    restart: unless-stopped
+    # Your uid/gid: the audit log on the host is yours.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      # Host header the orchestrator sends; anything else is refused.
+      MCP_ALLOWED_HOSTS: "executor:*"
+    volumes:
+      - ./commands_whitelist.md:/app/commands_whitelist.md:ro
+      - ./scripts:/app/scripts:ro
+      - ./command_audit.log:/app/command_audit.log
+    # No published ports. Not an internal network, so run_command can still
+    # SSH out to other cluster nodes.
+    networks: [exec]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   whisper:
     build:
@@ -49,6 +79,7 @@ services:
       STT_MODEL_DIR: /models
     volumes:
       - whisper-models:/models
+    networks: [stt]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health')"]
       interval: 10s
@@ -58,3 +89,7 @@ services:
 
 volumes:
   whisper-models:
+
+networks:
+  stt:
+  exec:

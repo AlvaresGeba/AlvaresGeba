@@ -10,11 +10,16 @@ Run this on each cluster node you want the AI to be able to act on, or run
 it once and have it SSH out to the other node for cluster-wide commands
 (see run_command's `target` argument).
 
+In docker it is its own service (executor) and serves MCP over streamable
+HTTP to the orchestrator: MCP_TRANSPORT=streamable-http. Without that it
+speaks stdio, for local testing.
+
 Requires: pip install "mcp[cli]" pyyaml
 """
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import logging
@@ -25,6 +30,7 @@ from typing import Literal
 
 import yaml
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -42,14 +48,31 @@ CLUSTER_NODES: dict[str, str] = {
     # "node2": "admin@10.0.0.2",
 }
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+# Only our own audit records go to the file, not the MCP library's
+# per-request chatter.
+_audit_handler = logging.FileHandler(LOG_FILE)
+_audit_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger = logging.getLogger("command_audit")
+logger.addHandler(_audit_handler)
+logger.setLevel(logging.INFO)
 
-mcp = FastMCP("cluster-command-server")
+# HTTP mode only (see __main__). MCP_ALLOWED_HOSTS is the Host header the
+# orchestrator uses (e.g. "executor:*"); anything else is refused, which
+# keeps DNS-rebinding protection on even though we listen on 0.0.0.0.
+MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.environ.get("MCP_PORT", 8000))
+MCP_ALLOWED_HOSTS = [h for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h]
+
+mcp = FastMCP(
+    "cluster-command-server",
+    host=MCP_HOST,
+    port=MCP_PORT,
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=MCP_ALLOWED_HOSTS + ["127.0.0.1:*", "localhost:*"],
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +125,7 @@ def _classify(command: str) -> tuple[Literal["allow", "confirm", "deny", "unknow
         if regex_mod.match(rule.pattern, command):
             return "allow", rule.description
 
-    #return "unknown", "No matching rule - rejected by default (fail closed)"
-    return "allow","test"
+    return "unknown", "No matching rule - rejected by default (fail closed)"
 
 def _run(command: str, target: str) -> dict:
     """Actually execute a command, locally or over SSH to a cluster node."""
@@ -218,4 +240,4 @@ def get_system_status(target: str = "local") -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(transport=os.environ.get("MCP_TRANSPORT", "stdio"))

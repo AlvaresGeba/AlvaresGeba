@@ -6,17 +6,17 @@ whisper service) to the guarded MCP command server, with Claude in between.
 
 Flow:
     text  ->  Claude Code (`claude -p`, headless)
-          ->  MCP tools of mcp_command_server.py  ->  short result line
+          ->  MCP tools of mcp_command_server.py (executor service, over HTTP)
+          ->  short result line
 
 Claude gets no shell and none of Claude Code's built-in tools (Bash, file
 editing, ...) - the only tools it sees are the ones mcp_command_server.py
-exposes. That server is the only thing that actually touches the shell, and
-it re-validates everything against commands_whitelist.md regardless of
-what Claude asked for.
+exposes. That server runs in its own container and is the only thing that
+actually touches the shell; it re-validates everything against
+commands_whitelist.md regardless of what Claude asked for.
 
 Requires the Claude Code CLI (`claude`) on PATH, logged in the same way as
 in the terminal (`claude`, then /login) - no API key needed.
-Requires: pip install "mcp[cli]"
 """
 
 from __future__ import annotations
@@ -25,19 +25,18 @@ import json
 import asyncio
 import os
 import sys
-from pathlib import Path
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "")  # empty = CLI default
 CLAUDE_TIMEOUT = float(os.environ.get("CLAUDE_TIMEOUT", 300))
 
-SERVER_SCRIPT = Path(__file__).parent / "mcp_command_server.py"
-
-# The MCP server Claude is given - started by Claude Code over stdio.
+# The executor service (mcp_command_server.py over streamable HTTP).
 # Its tools show up to Claude as mcp__cluster__<tool>.
+EXECUTOR_URL = os.environ.get("EXECUTOR_URL", "http://127.0.0.1:8000/mcp")
+
 MCP_CONFIG = {
     "mcpServers": {
-        "cluster": {"command": sys.executable, "args": [str(SERVER_SCRIPT)]},
+        "cluster": {"type": "http", "url": EXECUTOR_URL},
     }
 }
 

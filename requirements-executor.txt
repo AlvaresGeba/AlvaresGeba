@@ -1,0 +1,7 @@
+# Executor container: mcp_command_server.py
+# Pinned below 2.0: mcp 2.x renamed FastMCP -> MCPServer and changed several
+# APIs (see https://py.sdk.modelcontextprotocol.io/v2/migration/). The code
+# is written against the 1.x API; >=1.23 for streamable HTTP with
+# TransportSecuritySettings.
+mcp[cli]>=1.23,<2.0
+pyyaml>=6.0
