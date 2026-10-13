@@ -1,0 +1,11 @@
+.git
+.idea
+.venv
+**/__pycache__
+certs
+scripts
+logs
+tests
+command_audit.log
+commands_whitelist.md
+.env

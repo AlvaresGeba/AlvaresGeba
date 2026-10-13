@@ -1,0 +1,5 @@
+# STT container: stt.py + stt_service.py (Whisper)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+faster-whisper>=1.0
+numpy>=1.26

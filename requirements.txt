@@ -1,11 +1,4 @@
-# Pinned below 2.0: mcp 2.x renamed FastMCP -> MCPServer and changed several
-# APIs (see https://py.sdk.modelcontextprotocol.io/v2/migration/). All the
-# code in this project (mcp_command_server.py, command_router.py) is written
-# against the 1.x API. Bump this and follow the migration guide later if you
-# want v2's features - not required for anything here to work.
-mcp[cli]>=1.2.0,<2.0
-pyyaml>=6.0
-httpx>=0.27
-fastapi>=0.110
-uvicorn[standard]>=0.29
-pydantic>=2.6
+# Everything, for local development and tests. Each container installs only
+# its own file.
+-r requirements-orchestrator.txt
+-r requirements-stt.txt

@@ -1,0 +1,60 @@
+# whisper -> orchestrator -> claude
+#
+# whisper      - speech-to-text (stt_service.py), internal network only
+# orchestrator - gateway.py (mTLS, the only exposed port) + command_router.py,
+#                which runs Claude Code headless; Claude talks to the server
+#                only through mcp_command_server.py's MCP tools
+#
+# Claude uses the same login as `claude` in your terminal: your ~/.claude is
+# mounted into the orchestrator, which runs as your uid. Log in once on the
+# host (`claude`, then /login), then:
+#
+#   docker compose up -d --build
+
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/orchestrator.Dockerfile
+    restart: unless-stopped
+    # Your uid/gid: Claude writes into your ~/.claude, and certs/server.key
+    # is readable only by you.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      GATEWAY_HOST: 0.0.0.0
+      STT_URL: http://whisper:9000
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-}
+    ports:
+      # Published on the VPN address only, as before.
+      - "${GATEWAY_BIND:-100.99.129.107}:8443:8443"
+    volumes:
+      - ./certs:/app/certs:ro
+      - ./commands_whitelist.md:/app/commands_whitelist.md:ro
+      - ./scripts:/app/scripts:ro
+      - ./command_audit.log:/app/command_audit.log
+      - ${HOME}/.claude:/home/app/.claude
+    depends_on:
+      whisper:
+        condition: service_healthy
+
+  whisper:
+    build:
+      context: .
+      dockerfile: docker/stt.Dockerfile
+    restart: unless-stopped
+    environment:
+      STT_MODEL: ${STT_MODEL:-small}
+      STT_LANGUAGE: ${STT_LANGUAGE:-ru}
+      STT_CPU_THREADS: ${STT_CPU_THREADS:-4}
+      STT_MODEL_DIR: /models
+    volumes:
+      - whisper-models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10m  # first start downloads the Whisper model
+
+volumes:
+  whisper-models:
