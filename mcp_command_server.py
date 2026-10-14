@@ -6,6 +6,14 @@ execution surface to an LLM client. It does NOT give the model a raw shell.
 Every command is checked against commands_whitelist.md before it is allowed
 to run, and every attempt (allowed or not) is logged.
 
+How strict the check is depends on the elevation level, which only the
+phone can raise (see elevation.py in the orchestrator); it is read from the
+orchestrator before every command:
+    normal        allow runs, confirm needs confirm=true, the rest is refused
+    elevated      confirm rules run without confirm=true
+    unrestricted  commands that match no rule run too
+deny rules - and anything touching the audit log - are refused on every level.
+
 Run this on each cluster node you want the AI to be able to act on, or run
 it once and have it SSH out to the other node for cluster-wide commands
 (see run_command's `target` argument).
@@ -19,10 +27,12 @@ Requires: pip install "mcp[cli]" pyyaml
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import logging
+import urllib.request
 import re as regex_mod
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +42,8 @@ import yaml
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+import node_metrics
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -40,6 +52,16 @@ BASE_DIR = Path(__file__).parent
 WHITELIST_MD = BASE_DIR / "commands_whitelist.md"
 SCRIPTS_DIR = BASE_DIR / "scripts"
 LOG_FILE = BASE_DIR / "command_audit.log"
+
+# Read-only view of the orchestrator's elevation state. Unset or
+# unreachable = "normal" (fail closed).
+ELEVATION_URL = os.environ.get("ELEVATION_URL", "")
+
+# Units shown on the app's Server screen (systemd nodes only).
+MONITOR_UNITS = [u for u in os.environ.get("MONITOR_UNITS", "").split(",") if u]
+# In docker, the host's /etc/hostname is mounted here so the node is
+# reported by its real name, not the container id.
+HOST_HOSTNAME_FILE = Path(os.environ.get("HOST_HOSTNAME_FILE", "/host/hostname"))
 
 # Known cluster nodes this server is allowed to reach over SSH.
 # Add your real hostnames/IPs here. Keys used as the `target` argument.
@@ -106,11 +128,27 @@ def _load_whitelist() -> dict[str, list[Rule]]:
     return result
 
 
-def _classify(command: str) -> tuple[Literal["allow", "confirm", "deny", "unknown"], str]:
+def _elevation_level() -> str:
+    if not ELEVATION_URL:
+        return "normal"
+    try:
+        with urllib.request.urlopen(ELEVATION_URL, timeout=2) as resp:
+            level = json.load(resp).get("level", "normal")
+    except Exception:  # noqa: BLE001 - unreachable orchestrator = no elevation
+        logger.warning("Elevation lookup failed - treating as normal")
+        return "normal"
+    return level if level in ("normal", "elevated", "unrestricted") else "normal"
+
+
+def _classify(command: str, level: str = "normal") -> tuple[Literal["allow", "confirm", "deny", "unknown"], str]:
     """Decide what to do with a command string per the whitelist rules.
 
-    Deny is checked first and always wins, regardless of other matches.
+    Deny is checked first and always wins, regardless of other matches and
+    of the elevation level.
     """
+    if "command_audit" in command:
+        return "deny", "The audit log is off limits on every level"
+
     rules = _load_whitelist()
 
     for rule in rules["deny"]:
@@ -119,12 +157,16 @@ def _classify(command: str) -> tuple[Literal["allow", "confirm", "deny", "unknow
 
     for rule in rules["confirm"]:
         if regex_mod.match(rule.pattern, command):
+            if level != "normal":
+                return "allow", f"{rule.description} (restrictions lifted: {level})"
             return "confirm", rule.description
 
     for rule in rules["allow"]:
         if regex_mod.match(rule.pattern, command):
             return "allow", rule.description
 
+    if level == "unrestricted":
+        return "allow", "No matching rule - allowed because restrictions are lifted (unrestricted)"
     return "unknown", "No matching rule - rejected by default (fail closed)"
 
 def _run(command: str, target: str) -> dict:
@@ -178,9 +220,10 @@ def run_command(command: str, target: str = "local", confirm: bool = False) -> d
         confirm: must be True to execute anything classified as "confirm"
             risk level. Has no effect on "allow" or "deny" commands.
     """
-    decision, reason = _classify(command)
-    logger.info("REQUEST target=%s command=%r decision=%s reason=%s confirm=%s",
-                target, command, decision, reason, confirm)
+    level = _elevation_level()
+    decision, reason = _classify(command, level)
+    logger.info("REQUEST target=%s command=%r decision=%s reason=%s confirm=%s level=%s",
+                target, command, decision, reason, confirm, level)
 
     if decision == "deny":
         return {"executed": False, "reason": f"Blocked by deny rule: {reason}"}
@@ -190,7 +233,8 @@ def run_command(command: str, target: str = "local", confirm: bool = False) -> d
             "executed": False,
             "reason": "Command matches no allowlist rule. Refusing by default. "
                       "Call list_allowed_commands() to see what is permitted, "
-                      "or add a new rule to commands_whitelist.md.",
+                      "add a new rule to commands_whitelist.md, or ask the user "
+                      "to lift the restrictions from the phone.",
         }
 
     if decision == "confirm" and not confirm:
@@ -237,6 +281,56 @@ def get_system_status(target: str = "local") -> dict:
     read-only, no whitelist check needed since it can't change anything."""
     combined = " && echo '---' && ".join(["uptime", "df -h", "free -h"])
     return _run(combined, target)
+
+
+def _local_metrics() -> dict:
+    in_docker = Path("/.dockerenv").exists()
+    hostname = None
+    if HOST_HOSTNAME_FILE.is_file():
+        hostname = HOST_HOSTNAME_FILE.read_text().strip() or None
+    return node_metrics.collect(
+        node="local",
+        hostname=hostname,
+        # In a container /proc/mounts is the container's. statvfs on a
+        # bind-mounted file reports the filesystem it lives on: the
+        # hostname file sits on the host's root, "/" on docker's storage,
+        # scripts/ on the project's disk. Network counters would be the
+        # container's own - not worth showing.
+        disk_roots={"/": str(HOST_HOSTNAME_FILE), "docker": "/", "project": str(SCRIPTS_DIR)}
+        if in_docker else None,
+        net=not in_docker,
+        units=MONITOR_UNITS,
+    )
+
+
+def _remote_metrics(name: str, host: str) -> dict:
+    script = Path(node_metrics.__file__).read_text()
+    env = f"NODE_NAME={name} MONITOR_UNITS={','.join(MONITOR_UNITS)}"
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, f"{env} python3 -"],
+            input=script, capture_output=True, text=True, timeout=20,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip()[-300:] or f"exit {proc.returncode}")
+        return json.loads(proc.stdout)
+    except Exception as exc:  # noqa: BLE001 - a dead node is a result, not an error
+        return {"node": name, "ok": False, "error": str(exc), "hostname": host}
+
+
+@mcp.tool()
+def get_metrics(include_remote: bool = True) -> list[dict]:
+    """Structured health of every cluster node: CPU %, load, memory, disks,
+    uptime, temperature, network, docker containers, watched systemd units.
+    Read-only, no whitelist check needed."""
+    try:
+        nodes = [_local_metrics()]
+    except Exception as exc:  # noqa: BLE001
+        nodes = [{"node": "local", "ok": False, "error": str(exc)}]
+    if include_remote:
+        nodes += [_remote_metrics(name, host) for name, host in CLUSTER_NODES.items()
+                  if name != "local" and host]
+    return nodes
 
 
 if __name__ == "__main__":

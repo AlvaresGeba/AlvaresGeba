@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -8,6 +10,8 @@ from fastapi.testclient import TestClient
 
 import gateway
 import stt_service
+from command_router import CommandOutcome
+from history import History
 from stt import SAMPLE_RATE, AudioError, Settings, Transcriber, pcm16_to_float32
 
 
@@ -102,21 +106,32 @@ class SttServiceTests(unittest.TestCase):
         self.assertEqual(model.calls, [])
 
 
+def use_temp_history(test: unittest.TestCase) -> History:
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    history = History(Path(tmp.name) / "history.db")
+    patcher = mock.patch.object(gateway, "_history", history)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return history
+
+
 class VoiceEndpointTests(unittest.TestCase):
-    """gateway.py /voice with a fake STT service behind httpx."""
+    """gateway.py /command/audio with a fake STT service behind httpx."""
 
     def setUp(self) -> None:
         self.client = TestClient(gateway.app)
+        self.history = use_temp_history(self)
 
-    def post(self, body: bytes, stt_handler, router_result="OK: done"):
+    def post(self, body: bytes, stt_handler, router_result="OK: done", query="&lang=ru"):
         """`stt_handler` plays the stt container: httpx.Request -> httpx.Response."""
-        router = mock.AsyncMock(return_value=router_result)
+        router = mock.AsyncMock(return_value=CommandOutcome(router_result, router_result + "\n\nfull"))
         real_client = httpx.AsyncClient
         fake_client = lambda **kw: real_client(transport=httpx.MockTransport(stt_handler), **kw)
         with mock.patch.object(gateway.httpx, "AsyncClient", fake_client), \
                 mock.patch.object(gateway, "handle_text_command", router):
             response = self.client.post(
-                "/voice?device_id=watch-01",
+                "/command/audio?device_id=watch-01" + query,
                 content=body,
                 headers={"content-type": "application/octet-stream"},
             )
@@ -133,16 +148,33 @@ class VoiceEndpointTests(unittest.TestCase):
         response, router = self.post(pcm, stt)
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json(), {"text": "статус сервера", "result": "OK: done"})
-        router.assert_awaited_once_with("статус сервера")
-        self.assertEqual(str(sent[0].url), f"{gateway.STT_URL}/transcribe")
+        body = response.json()
+        self.assertEqual(body["transcript"], "статус сервера")
+        self.assertEqual(body["result"], "OK: done")
+        self.assertEqual(body["detail"], "OK: done\n\nfull")
+        self.assertIsNone(body["error"])
+        self.assertEqual(router.await_args.args[0], "статус сервера")
+        self.assertEqual(str(sent[0].url), f"{gateway.STT_URL}/transcribe?language=ru")
         self.assertEqual(sent[0].content, pcm)
+
+        [entry] = self.history.recent()
+        self.assertEqual((entry["channel"], entry["device_id"], entry["ok"]), ("voice", "watch-01", 1))
+
+    def test_no_lang_means_autodetect(self) -> None:
+        sent = []
+
+        def stt(request: httpx.Request) -> httpx.Response:
+            sent.append(request)
+            return httpx.Response(200, json={"text": "hello"})
+
+        self.post(make_pcm(2.0), stt, query="")
+        self.assertEqual(sent[0].url.params["language"], "auto")
 
     def test_unrecognised_speech_does_not_reach_router(self) -> None:
         response, router = self.post(make_pcm(2.0), lambda r: httpx.Response(200, json={"text": ""}))
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["text"], "")
+        self.assertEqual(response.json()["transcript"], "")
         self.assertTrue(response.json()["result"].startswith("ERROR"))
         router.assert_not_awaited()
 
@@ -172,12 +204,16 @@ class VoiceEndpointTests(unittest.TestCase):
         stt.assert_not_called()
         router.assert_not_awaited()
 
-    def test_router_failure_is_500(self) -> None:
+    def test_router_failure_is_reported_and_recorded(self) -> None:
         router = mock.AsyncMock(side_effect=RuntimeError("boom"))
         with mock.patch.object(gateway, "transcribe_audio", mock.AsyncMock(return_value="диск")), \
                 mock.patch.object(gateway, "handle_text_command", router):
             response = self.client.post("/voice", content=make_pcm(1.0))
-        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["error"], "boom")
+        self.assertTrue(response.json()["result"].startswith("ERROR"))
+        [entry] = self.history.recent(failures=True)
+        self.assertEqual(entry["transcript"], "диск")
 
 
 if __name__ == "__main__":

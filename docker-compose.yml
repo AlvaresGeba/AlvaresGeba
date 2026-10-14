@@ -1,9 +1,13 @@
 # whisper -> orchestrator -> claude -> executor
 #
 # whisper      - speech-to-text (stt_service.py), internal network only
-# orchestrator - gateway.py (mTLS, the only exposed port) + command_router.py,
-#                which runs Claude Code headless. It cannot run commands
-#                itself: Claude only gets the executor's MCP tools.
+# orchestrator - gateway.py (mTLS, the only exposed port): the phone app's
+#                API and its control WebSocket, elevation (lifting the
+#                restrictions, approved only from the phone), history, logs.
+#                command_router.py runs Claude Code headless with two MCP
+#                servers: the executor's "cluster" tools and the "phone"
+#                tools (phone_hub.py, loopback only). It cannot run shell
+#                commands itself.
 # executor     - mcp_command_server.py over HTTP, internal network only. The
 #                only container that runs commands; it checks every one
 #                against commands_whitelist.md.
@@ -31,12 +35,22 @@ services:
       STT_URL: http://whisper:9000
       EXECUTOR_URL: http://executor:8000/mcp
       CLAUDE_MODEL: ${CLAUDE_MODEL:-}
+      # Internal server: /mcp answers loopback only, /internal/elevation
+      # is what the executor reads.
+      INTERNAL_HOST: 0.0.0.0
+      DATA_DIR: /app/data
+      # Optional PIN asked on the phone when approving a voice request to
+      # lift the restrictions.
+      ELEVATION_PIN: ${ELEVATION_PIN:-}
     ports:
       # Published on the VPN address only, as before.
       - "${GATEWAY_BIND:-100.99.129.107}:8443:8443"
     volumes:
       - ./certs:/app/certs:ro
       - ${HOME}/.claude:/home/app/.claude
+      - orchestrator-data:/app/data
+      # Tailed into the app's Logs screen.
+      - ./command_audit.log:/app/command_audit.log:ro
     networks: [default, stt, exec]
     depends_on:
       whisper:
@@ -54,10 +68,15 @@ services:
     environment:
       # Host header the orchestrator sends; anything else is refused.
       MCP_ALLOWED_HOSTS: "executor:*"
+      ELEVATION_URL: http://orchestrator:8001/internal/elevation
+      # systemd units to show on the app's Server screen, e.g. "nginx,ssh"
+      MONITOR_UNITS: ${MONITOR_UNITS:-}
     volumes:
       - ./commands_whitelist.md:/app/commands_whitelist.md:ro
       - ./scripts:/app/scripts:ro
       - ./command_audit.log:/app/command_audit.log
+      # The node's real name for the Server screen.
+      - /etc/hostname:/host/hostname:ro
     # No published ports. Not an internal network, so run_command can still
     # SSH out to other cluster nodes.
     networks: [exec]
@@ -89,6 +108,7 @@ services:
 
 volumes:
   whisper-models:
+  orchestrator-data:
 
 networks:
   stt:

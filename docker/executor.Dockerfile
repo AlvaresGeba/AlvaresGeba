@@ -12,7 +12,7 @@ RUN apt-get update \
 COPY requirements-executor.txt .
 RUN pip install --no-cache-dir -r requirements-executor.txt
 
-COPY mcp_command_server.py ./
+COPY mcp_command_server.py node_metrics.py ./
 
 # scripts/, commands_whitelist.md and the audit log are mounted at runtime
 # (see docker-compose.yml) - they never get baked into the image.

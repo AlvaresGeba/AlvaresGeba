@@ -1,4 +1,7 @@
-# Orchestrator container: gateway.py + command_router.py
+# Orchestrator container: gateway.py + command_router.py + phone_hub.py
+# mcp: serves the phone tools and asks the executor for metrics. Pinned
+# below 2.0 like the executor (see requirements-executor.txt).
+mcp[cli]>=1.23,<2.0
 httpx>=0.27
 fastapi>=0.110
 uvicorn[standard]>=0.29

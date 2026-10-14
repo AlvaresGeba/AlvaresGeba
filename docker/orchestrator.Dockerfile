@@ -27,10 +27,14 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION}" \
 RUN mkdir -m 1777 /home/app
 ENV HOME=/home/app
 
-COPY gateway.py command_router.py ./
+COPY gateway.py command_router.py phone_hub.py elevation.py history.py log_buffer.py ./
 
-# certs/ is mounted at runtime (see docker-compose.yml) - never baked into
-# the image.
+# data/ holds the request history (a docker volume; world-writable so the
+# volume works for whatever uid the container runs as). certs/ is mounted
+# at runtime (see docker-compose.yml) - never baked into the image.
+RUN mkdir -m 1777 /app/data
+# 8443: the mTLS gateway. 8001 (internal, not published): phone MCP on
+# loopback + the elevation level for the executor.
 EXPOSE 8443
 # ~/.claude.json lives outside the mounted ~/.claude; without it Claude Code
 # prints a "configuration file not found" warning on every run.

@@ -6,6 +6,7 @@ next to the orchestrator (gateway.py). Only reachable on the internal
 docker network - the gateway is the single network-facing entry point.
 
     POST /transcribe   body: raw PCM, 16 kHz, s16le, mono (application/octet-stream)
+                       ?language=ru|en|...|auto (optional, default STT_LANGUAGE)
                        -> {"text": "..."}; 400 for unusable audio, 413 if too big
     GET  /health       -> {"status": "ok"} once the model is loaded
 
@@ -41,14 +42,14 @@ app = FastAPI(title="stt", lifespan=lifespan)
 
 
 @app.post("/transcribe")
-async def transcribe(request: Request):
+async def transcribe(request: Request, language: str | None = None):
     pcm = await request.body()
     if len(pcm) > MAX_VOICE_BYTES:
         raise HTTPException(status_code=413, detail="Audio too large")
 
     try:
         # Whisper is CPU-bound and blocking: keep it off the event loop.
-        text = await anyio.to_thread.run_sync(get_transcriber().transcribe, pcm)
+        text = await anyio.to_thread.run_sync(get_transcriber().transcribe, pcm, language)
     except AudioError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

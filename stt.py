@@ -136,16 +136,22 @@ class Transcriber:
 
     # -- transcription --------------------------------------------------
 
-    def transcribe(self, pcm: bytes) -> str:
-        """Blocking transcription of raw PCM. Returns "" if nothing was recognised."""
+    def transcribe(self, pcm: bytes, language: str | None = None) -> str:
+        """Blocking transcription of raw PCM. Returns "" if nothing was recognised.
+        language: Whisper language code, "auto" to detect it, None for the
+        configured default (STT_LANGUAGE)."""
         audio = self.validate(pcm)
         model = self._get_model()
         s = self.settings
+        if language is None:
+            language = s.language
+        if language == "auto":
+            language = None
 
         with self._run_lock:
             segments, info = model.transcribe(
                 audio,
-                language=s.language,
+                language=language,
                 beam_size=1,                       # greedy: fastest on CPU
                 vad_filter=True,                   # drop non-speech before decoding
                 vad_parameters={"min_silence_duration_ms": 300},
