@@ -7,3 +7,4 @@ commands_whitelist.md
 .env
 data/
 certs-backup-old-ip/
+ssh/

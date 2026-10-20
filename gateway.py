@@ -1,16 +1,24 @@
 """
 gateway.py
 
-The only network-facing entry point. Everything else (whisper, the
-executor's MCP server) is reachable only on internal docker networks. This
-process terminates mutual-TLS connections coming from the phone app over
-the VPN tunnel and serves everything the app (WatchCommandApp) talks to:
+The orchestrator: the only network-facing entry point, and the one that
+hands every task to an agent. It runs no model and no tools itself.
+Everything else is reachable only on internal docker networks:
 
-    POST /command                 typed command -> Claude -> tools
+    whisper   speech-to-text
+    executor  the agent (executor_agent.py): Claude Code + the server tools
+    phone     the phone link (phone_service.py)
+
+This process terminates mutual-TLS connections coming from the phone app
+over the VPN tunnel and serves everything the app (WatchCommandApp) talks
+to:
+
+    POST /command                 typed command -> an agent
     POST /command/audio           watch audio (raw PCM) -> Whisper -> same
-    WS   /phone/ws                the phone's control channel (phone_hub.py)
+    WS   /phone/ws                the phone's control channel, relayed to
+                                  the phone service as is
     GET  /elevation, POST /elevation/{request,confirm,deny,revoke}
-    GET  /monitor, /agent/tools   cluster health, the tools Claude has
+    GET  /monitor, /agent/tools   cluster health, the agents' tools
     GET  /history/recent, /history/stats
     GET  /logs/recent, /logs/stream (Server-Sent Events)
     GET  /health
@@ -20,11 +28,11 @@ your own CA, or the TLS handshake fails before any application code runs
 at all. A stolen bearer token is not enough to talk to this server - the
 attacker would need the phone's private key file too.
 
-A second, plain-HTTP server (INTERNAL_PORT, not published) carries:
-    /mcp                  the "phone" MCP server - loopback only, for the
-                          Claude Code process running in this container
-    /internal/elevation   the current elevation level, read-only, for the
-                          executor
+A second, plain-HTTP server (INTERNAL_PORT; docker networks + host
+loopback) carries the elevation state for the other services:
+    GET  /internal/elevation           status (level, time left, pending)
+    POST /internal/elevation/request   a request to lift the restrictions;
+                                       granted only from the phone, here
 
 See README.md for the openssl commands to generate:
   ca.pem            - your private certificate authority
@@ -46,19 +54,14 @@ from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException, WebSocket
-from fastapi.responses import JSONResponse, StreamingResponse
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+import websockets
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from starlette.routing import Route
 
-import command_router
-from command_router import handle_text_command
 from elevation import Elevation, ElevationError
 from history import History
 from log_buffer import BufferHandler, LogBuffer, tail_audit_log
-from phone_hub import PhoneHub, build_phone_mcp
 
 BASE_DIR = Path(__file__).parent
 CERT_DIR = BASE_DIR / "certs"
@@ -70,6 +73,19 @@ STT_URL = os.environ.get("STT_URL", "http://127.0.0.1:9000")
 STT_TIMEOUT = float(os.environ.get("STT_TIMEOUT", 60))
 INTERNAL_PORT = int(os.environ.get("INTERNAL_PORT", 8001))
 
+# The agents tasks are handed to: name -> base URL. Each implements
+#   POST /task {"text", "request_id", "device_id"}
+#        -> {"short", "detail", "steps", "needs_confirmation"}
+#   GET /tools, GET /info
+# (see executor_agent.py). For now there is one.
+AGENTS = {"executor": os.environ.get("EXECUTOR_URL", "http://127.0.0.1:8000")}
+# Claude's own timeout in the agent is 300 s; leave it room to report it.
+AGENT_TIMEOUT = float(os.environ.get("AGENT_TIMEOUT", 330))
+
+# The phone link (phone_service.py).
+PHONE_URL = os.environ.get("PHONE_URL", "http://127.0.0.1:8002")
+PHONE_WS_URL = PHONE_URL.replace("http", "ws", 1) + "/phone/ws"
+
 STARTED_AT = time.time()
 
 log_buffer = LogBuffer()
@@ -78,11 +94,6 @@ logging.getLogger().addHandler(BufferHandler(log_buffer))
 logger = logging.getLogger("gateway")
 
 elevation = Elevation()
-phones = PhoneHub()
-# request id -> {"device_id": ...} while a command is running; read by the
-# phone MCP server (X-Request-Id header, see command_router.mcp_config).
-active_requests: dict[str, dict] = {}
-phone_mcp = build_phone_mcp(phones, elevation, active_requests)
 
 _history: History | None = None
 
@@ -111,6 +122,28 @@ app = FastAPI(title="cluster-command-gateway", lifespan=lifespan)
 # Commands
 # ---------------------------------------------------------------------------
 
+def pick_agent(text: str) -> str:
+    """Which agent gets the task. One agent so far - routing goes here when
+    there are more."""
+    return "executor"
+
+
+async def dispatch(text: str, request_id: str, device_id: str) -> dict:
+    """Hand the task to an agent and wait for its answer:
+    {"short", "detail", "steps", "needs_confirmation"}."""
+    agent = pick_agent(text)
+    async with httpx.AsyncClient(timeout=AGENT_TIMEOUT) as client:
+        response = await client.post(f"{AGENTS[agent]}/task", json={
+            "text": text, "request_id": request_id, "device_id": device_id})
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail")
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(f"{agent}: {detail or response.status_code}")
+    return response.json()
+
+
 class CommandRequest(BaseModel):
     text: str
     # Optional client-side identifier for audit logs (e.g. "watch-01")
@@ -118,23 +151,20 @@ class CommandRequest(BaseModel):
 
 
 async def run_pipeline(text: str, device_id: str, channel: str) -> dict:
-    """Claude + tools for one command; the reply in the app's
+    """One command through an agent; the reply in the app's
     CommandResponse shape, recorded in the history either way."""
     request_id = secrets.token_hex(8)
     started = time.time()
     level = elevation.level()
-    active_requests[request_id] = {"device_id": device_id}
     error = None
     try:
-        outcome = await handle_text_command(text, request_id)
-        short, detail = outcome.short, outcome.detail
-        steps, needs_confirmation = outcome.steps, outcome.needs_confirmation
+        outcome = await dispatch(text, request_id, device_id)
+        short, detail = outcome["short"], outcome["detail"]
+        steps, needs_confirmation = outcome.get("steps", []), outcome.get("needs_confirmation", False)
     except Exception as exc:  # noqa: BLE001 - we want to report any failure to the client
         logger.exception("Command pipeline failed")
         error = str(exc)
         short, detail, steps, needs_confirmation = f"ERROR: {error[:80]}", error, [], False
-    finally:
-        active_requests.pop(request_id, None)
 
     took_ms = int((time.time() - started) * 1000)
     ok = error is None and not short.startswith(("REJECTED", "ERROR"))
@@ -239,7 +269,33 @@ async def receive_voice(request: Request, device_id: str = "unknown", lang: str 
 
 @app.websocket("/phone/ws")
 async def phone_socket(ws: WebSocket):
-    await phones.serve(ws)
+    """Relays the phone's socket to the phone service, message for message.
+    TLS and the client certificate end here; the protocol is the phone
+    service's business."""
+    await ws.accept()
+    try:
+        async with websockets.connect(PHONE_WS_URL, open_timeout=5) as upstream:
+            async def phone_to_service():
+                while True:
+                    await upstream.send(await ws.receive_text())
+
+            async def service_to_phone():
+                async for message in upstream:
+                    await ws.send_text(message if isinstance(message, str) else message.decode())
+
+            tasks = [asyncio.create_task(phone_to_service()), asyncio.create_task(service_to_phone())]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            close_code = upstream.close_code
+    except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as exc:
+        logger.warning("Phone service unreachable: %s", exc)
+        close_code = 1011
+    try:
+        await ws.close(code=close_code or 1000)
+    except (RuntimeError, WebSocketDisconnect):
+        pass  # the phone is already gone
 
 
 # ---------------------------------------------------------------------------
@@ -304,40 +360,39 @@ async def elevation_revoke():
 # Monitoring
 # ---------------------------------------------------------------------------
 
-async def executor_session_call(fn):
-    async with streamablehttp_client(command_router.EXECUTOR_URL, timeout=10,
-                                     sse_read_timeout=30) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            return await fn(session)
+async def service_get(url: str, timeout: float = 12):
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(url)
+    response.raise_for_status()
+    return response.json()
 
 
-def _tool_payload(result):
-    if result.structuredContent is not None:
-        data = result.structuredContent
-        return data.get("result", data) if isinstance(data, dict) else data
-    text = "".join(getattr(c, "text", "") for c in result.content)
-    return json.loads(text)
+async def _or_error(what: str, coro, fallback):
+    try:
+        return await coro
+    except Exception as exc:  # noqa: BLE001 - show the failure on the screen, not a 500
+        logger.warning("%s unavailable: %s", what, exc)
+        return fallback(exc)
 
 
 @app.get("/monitor")
 async def monitor(remote: bool = True):
-    try:
-        result = await asyncio.wait_for(executor_session_call(
-            lambda s: s.call_tool("get_metrics", {"include_remote": remote})), timeout=11)
-        if result.isError:
-            raise RuntimeError(_tool_payload(result) if result.content else "get_metrics failed")
-        nodes = _tool_payload(result)
-    except Exception as exc:  # noqa: BLE001 - show the failure on the screen, not a 500
-        logger.warning("Metrics unavailable: %s", exc)
-        nodes = [{"node": "local", "ok": False, "error": f"executor: {exc}"}]
+    executor = AGENTS["executor"]
+    nodes, phones, info = await asyncio.gather(
+        _or_error("Metrics", service_get(f"{executor}/metrics?remote={str(remote).lower()}"),
+                  lambda exc: [{"node": "local", "ok": False, "error": f"executor: {exc}"}]),
+        _or_error("Phone list", service_get(f"{PHONE_URL}/phones", timeout=5), lambda exc: {}),
+        _or_error("Agent info", service_get(f"{executor}/info", timeout=5),
+                  lambda exc: {"model": "unknown", "mcp_servers": []}),
+    )
     return {
         "nodes": nodes,
         "gateway": {
             "uptime_s": int(time.time() - STARTED_AT),
-            "phones": phones.links(),
-            "model": command_router.CLAUDE_MODEL or "default",
-            "mcp_servers": list(command_router.MCP_SERVERS),
+            "phones": phones,
+            "model": info.get("model", "unknown"),
+            "mcp_servers": info.get("mcp_servers", []),
+            "agents": list(AGENTS),
         },
         "collected_at": time.time(),
     }
@@ -345,14 +400,10 @@ async def monitor(remote: bool = True):
 
 @app.get("/agent/tools")
 async def agent_tools():
-    tools = [{"server": "phone", "name": t.name, "description": (t.description or "").strip()}
-             for t in await phone_mcp.list_tools()]
-    try:
-        listed = await asyncio.wait_for(executor_session_call(lambda s: s.list_tools()), timeout=10)
-        tools = [{"server": "cluster", "name": t.name, "description": (t.description or "").strip()}
-                 for t in listed.tools] + tools
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Executor tools unavailable: %s", exc)
+    tools = []
+    for name, url in AGENTS.items():
+        listed = await _or_error(f"{name} tools", service_get(f"{url}/tools"), lambda exc: {})
+        tools += listed.get("tools", [])
     return {"tools": tools}
 
 
@@ -418,29 +469,37 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Internal server (plain HTTP, not published)
+# Internal server (plain HTTP: docker networks + host loopback)
 # ---------------------------------------------------------------------------
 
-async def _internal_elevation(_request):
-    return JSONResponse({"level": elevation.level()})
+class ElevationAsk(BaseModel):
+    level: str
+    minutes: int
+    reason: str = ""
+    device_id: str = "unknown"
 
 
-def build_internal_app():
-    """The phone MCP app plus /internal/elevation. /mcp answers loopback
-    only: the executor (and anything else on the docker networks) can read
-    the elevation level but never drive the phone."""
-    inner = phone_mcp.streamable_http_app()
-    inner.router.routes.append(Route("/internal/elevation", _internal_elevation))
+def build_internal_app() -> FastAPI:
+    """Elevation for the other services: anyone here may read it or ask for
+    it; only the phone (the mTLS API) can grant it."""
+    internal = FastAPI(title="orchestrator-internal")
 
-    async def guarded(scope, receive, send):
-        if scope["type"] == "http" and not scope["path"].startswith("/internal/"):
-            client = scope.get("client") or ("", 0)
-            if client[0] not in ("127.0.0.1", "::1"):
-                await JSONResponse({"detail": "loopback only"}, status_code=403)(scope, receive, send)
-                return
-        await inner(scope, receive, send)
+    @internal.get("/internal/elevation")
+    async def internal_elevation():
+        return elevation.status()
 
-    return guarded
+    @internal.post("/internal/elevation/request")
+    async def internal_elevation_request(body: ElevationAsk):
+        try:
+            challenge = elevation.request(body.level, body.minutes * 60, body.reason, body.device_id)
+        except ElevationError as exc:
+            return {"ok": False, "error": str(exc)}
+        logger.warning("Elevation requested: level=%s ttl=%ss device=%s code=%s reason=%r",
+                       challenge.level, challenge.ttl_s, body.device_id, challenge.code, body.reason)
+        return {"ok": True, "pending": True, "code": challenge.code,
+                "message": "Waiting for approval in the phone app (expires in 2 min)."}
+
+    return internal
 
 
 def build_ssl_context() -> ssl.SSLContext:

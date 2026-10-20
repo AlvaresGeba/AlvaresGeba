@@ -10,7 +10,6 @@ from fastapi.testclient import TestClient
 
 import gateway
 import stt_service
-from command_router import CommandOutcome
 from history import History
 from stt import SAMPLE_RATE, AudioError, Settings, Transcriber, pcm16_to_float32
 
@@ -125,11 +124,12 @@ class VoiceEndpointTests(unittest.TestCase):
 
     def post(self, body: bytes, stt_handler, router_result="OK: done", query="&lang=ru"):
         """`stt_handler` plays the stt container: httpx.Request -> httpx.Response."""
-        router = mock.AsyncMock(return_value=CommandOutcome(router_result, router_result + "\n\nfull"))
+        router = mock.AsyncMock(return_value={"short": router_result, "detail": router_result + "\n\nfull",
+                                              "steps": [], "needs_confirmation": False})
         real_client = httpx.AsyncClient
         fake_client = lambda **kw: real_client(transport=httpx.MockTransport(stt_handler), **kw)
         with mock.patch.object(gateway.httpx, "AsyncClient", fake_client), \
-                mock.patch.object(gateway, "handle_text_command", router):
+                mock.patch.object(gateway, "dispatch", router):
             response = self.client.post(
                 "/command/audio?device_id=watch-01" + query,
                 content=body,
@@ -207,7 +207,7 @@ class VoiceEndpointTests(unittest.TestCase):
     def test_router_failure_is_reported_and_recorded(self) -> None:
         router = mock.AsyncMock(side_effect=RuntimeError("boom"))
         with mock.patch.object(gateway, "transcribe_audio", mock.AsyncMock(return_value="диск")), \
-                mock.patch.object(gateway, "handle_text_command", router):
+                mock.patch.object(gateway, "dispatch", router):
             response = self.client.post("/voice", content=make_pcm(1.0))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["error"], "boom")

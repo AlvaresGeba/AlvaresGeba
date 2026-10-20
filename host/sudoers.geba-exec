@@ -1,0 +1,22 @@
+# geba-exec: the executor container's account on this host.
+# Installed as /etc/sudoers.d/geba-exec by host/setup-host-access.sh.
+#
+# The second line of defence behind commands_whitelist.md: whatever the
+# executor sends, geba-exec gets root only for these commands. Keep it in
+# step with the whitelist rules that need root (and with ROOT_COMMANDS in
+# mcp_command_server.py, which puts "sudo -n" in front of them).
+#
+# Everything else as root goes through geba-root, which works only while
+# the restrictions are lifted to "unrestricted" from the phone.
+
+Defaults:geba-exec !requiretty, !lecture
+
+Cmnd_Alias GEBA_DOCKER  = /usr/bin/docker ps, /usr/bin/docker ps -a, \
+                          /usr/bin/docker ps -a --format *, \
+                          /usr/bin/docker logs *, /usr/bin/docker restart *, \
+                          /usr/bin/docker compose -f * up -d
+Cmnd_Alias GEBA_SYSTEMD = /usr/bin/systemctl restart *, /usr/bin/systemctl stop *
+Cmnd_Alias GEBA_POWER   = /usr/sbin/reboot
+
+geba-exec ALL=(root) NOPASSWD: GEBA_DOCKER, GEBA_SYSTEMD, GEBA_POWER, \
+                               /usr/local/lib/geba/geba-root

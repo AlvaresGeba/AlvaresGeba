@@ -1,24 +1,24 @@
 """
 command_router.py
 
-Bridges natural-language text (already transcribed from voice by the
-whisper service) to the guarded tools, with Claude in between.
+The executor agent's brain: runs Claude Code on one task the orchestrator
+handed over (executor_agent.py) and turns its output into the answer.
 
 Flow:
-    text  ->  Claude Code (`claude -p`, headless)
+    text  ->  Claude Code (`claude -p`, headless, in the executor container)
           ->  MCP tools:
-                cluster - mcp_command_server.py (executor service, over HTTP):
-                          shell commands checked against commands_whitelist.md
-                phone   - phone_hub.py (in this process, 127.0.0.1 only):
-                          actions on the phone over its WebSocket
+                cluster - mcp_command_server.py (stdio, started by Claude in
+                          this container): shell commands checked against
+                          commands_whitelist.md, metrics, elevation requests
+                phone   - the phone service (phone_service.py, its own
+                          container, over HTTP): actions on the phone
           ->  one short line for the watch + the full answer and every tool
               call for the phone app
 
 Claude gets no shell and none of Claude Code's built-in tools (Bash, file
-editing, ...) - the only tools it sees are those two MCP servers. The
-executor runs in its own container and is the only thing that actually
-touches the shell; it re-validates everything against commands_whitelist.md
-regardless of what Claude asked for.
+editing, ...) - the only tools it sees are those two MCP servers, and
+mcp_command_server.py re-validates every command against
+commands_whitelist.md regardless of what Claude asked for.
 
 Requires the Claude Code CLI (`claude`) on PATH, logged in the same way as
 in the terminal (`claude`, then /login) - no API key needed.
@@ -31,33 +31,32 @@ import asyncio
 import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "")  # empty = CLI default
 CLAUDE_TIMEOUT = float(os.environ.get("CLAUDE_TIMEOUT", 300))
 
-# The executor service (mcp_command_server.py over streamable HTTP).
-EXECUTOR_URL = os.environ.get("EXECUTOR_URL", "http://127.0.0.1:8000/mcp")
-# The phone tools, served by gateway.py on loopback.
-PHONE_MCP_URL = os.environ.get("PHONE_MCP_URL", "http://127.0.0.1:8001/mcp")
+# The cluster tools: started by Claude as a child process, per task.
+COMMAND_SERVER = str(Path(__file__).with_name("mcp_command_server.py"))
+# The phone tools (phone_service.py, its own container).
+PHONE_MCP_URL = os.environ.get("PHONE_MCP_URL", "http://127.0.0.1:8002/mcp")
 
 # Tools show up to Claude as mcp__<server>__<tool>.
 MCP_SERVERS = ("cluster", "phone")
 
 
-def mcp_config(request_id: str = "") -> dict:
-    """The phone server is told which command a call belongs to, so
-    request_elevation knows which device asked."""
+def mcp_config(device_id: str = "") -> dict:
+    """The cluster server is told which device the task came from, so
+    request_elevation knows who asked."""
     return {
         "mcpServers": {
-            "cluster": {"type": "http", "url": EXECUTOR_URL},
-            "phone": {"type": "http", "url": PHONE_MCP_URL,
-                      "headers": {"X-Request-Id": request_id}},
+            "cluster": {"type": "stdio", "command": sys.executable, "args": [COMMAND_SERVER],
+                        "env": {"REQUEST_DEVICE_ID": device_id}},
+            "phone": {"type": "http", "url": PHONE_MCP_URL},
         }
     }
 
-
-MCP_CONFIG = mcp_config()
 
 SYSTEM_PROMPT = """\
 You control a Debian Linux server cluster and the user's Android phone
@@ -69,13 +68,15 @@ through a restricted set of tools. You do not have a real shell.
 - run_script(script_name, args=[], target="local") -> runs a pre-approved script
 - get_system_status(target="local") -> read-only health snapshot
 - get_metrics(include_remote=true) -> structured CPU/memory/disk per node
+- elevation_status, request_elevation
 
-"phone" MCP server (the phone the request came through):
+"phone" MCP server (the user's phone):
 - phone_status, read_screen, tap, type_text, scroll, press_key, list_apps,
   open_app, open_url, set_alarm, set_timer, flashlight, volume,
   do_not_disturb, media, notifications, send_sms, call
-- elevation_status, request_elevation
 
+target "local" is the server itself (the host, not a container). Never put
+sudo in commands: the server uses root itself where it is allowed.
 Always call list_allowed_commands first if you are unsure what is permitted.
 To operate an app on the phone: open_app, then read_screen, then tap /
 type_text using node ids from the latest read_screen.
@@ -107,12 +108,12 @@ class CommandOutcome:
     needs_confirmation: bool = False
 
 
-def build_claude_command(request_id: str = "") -> list[str]:
+def build_claude_command(device_id: str = "") -> list[str]:
     cmd = [
         CLAUDE_BIN, "-p",
         "--output-format", "stream-json", "--verbose",
         "--system-prompt", SYSTEM_PROMPT,
-        "--mcp-config", json.dumps(mcp_config(request_id)),
+        "--mcp-config", json.dumps(mcp_config(device_id)),
         "--strict-mcp-config",
         "--tools", "",                    # no built-in tools: no Bash, no file access
         # MCP tools run without a permission prompt
@@ -215,11 +216,11 @@ def split_reply(text: str) -> tuple[str, str]:
     return "", text
 
 
-async def handle_text_command(user_text: str, request_id: str = "") -> CommandOutcome:
+async def handle_text_command(user_text: str, device_id: str = "") -> CommandOutcome:
     """Full pipeline entry point: raw text in, result out.
-    This is what gateway.py calls for each incoming request."""
+    This is what executor_agent.py calls for each task."""
     proc = await asyncio.create_subprocess_exec(
-        *build_claude_command(request_id),
+        *build_claude_command(device_id),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

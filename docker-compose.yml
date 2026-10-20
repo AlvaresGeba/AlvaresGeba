@@ -1,23 +1,26 @@
-# whisper -> orchestrator -> claude -> executor
+# orchestrator -> agents (executor) -> tools (host, phone)
 #
-# whisper      - speech-to-text (stt_service.py), internal network only
 # orchestrator - gateway.py (mTLS, the only exposed port): the phone app's
-#                API and its control WebSocket, elevation (lifting the
-#                restrictions, approved only from the phone), history, logs.
-#                command_router.py runs Claude Code headless with two MCP
-#                servers: the executor's "cluster" tools and the "phone"
-#                tools (phone_hub.py, loopback only). It cannot run shell
-#                commands itself.
-# executor     - mcp_command_server.py over HTTP, internal network only. The
-#                only container that runs commands; it checks every one
-#                against commands_whitelist.md.
+#                API, elevation (lifting the restrictions, approved only
+#                from the phone), history, logs. Hands every command to an
+#                agent; runs no model and no tools itself. Relays the
+#                phone's control WebSocket to the phone service.
+# whisper      - speech-to-text (stt_service.py), for the orchestrator.
+# executor     - the agent (executor_agent.py): Claude Code runs here, with
+#                the cluster tools (mcp_command_server.py, every command
+#                checked against commands_whitelist.md, run on the host over
+#                SSH) and the phone service's tools.
+# phone        - the phone link (phone_service.py): the phone's WebSocket and
+#                the tools that drive it, nothing else.
 #
-# whisper and executor are on separate networks: each can talk only to the
-# orchestrator, not to each other.
+# Networks: whisper talks only to the orchestrator (stt); the executor to
+# the orchestrator (exec, which also reaches the host and the internet for
+# Claude); the phone service only to those two (phonelink, internal).
 #
 # Claude uses the same login as `claude` in your terminal: your ~/.claude is
-# mounted into the orchestrator, which runs as your uid. Log in once on the
-# host (`claude`, then /login), then:
+# mounted into the executor, which runs as your uid. Log in once on the
+# host (`claude`, then /login), set up host access once
+# (`sudo host/setup-host-access.sh`), then:
 #
 #   docker compose up -d --build
 
@@ -27,16 +30,15 @@ services:
       context: .
       dockerfile: docker/orchestrator.Dockerfile
     restart: unless-stopped
-    # Your uid/gid: Claude writes into your ~/.claude, and certs/server.key
-    # is readable only by you.
+    # Your uid/gid: certs/server.key is readable only by you.
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:
       GATEWAY_HOST: 0.0.0.0
       STT_URL: http://whisper:9000
-      EXECUTOR_URL: http://executor:8000/mcp
-      CLAUDE_MODEL: ${CLAUDE_MODEL:-}
-      # Internal server: /mcp answers loopback only, /internal/elevation
-      # is what the executor reads.
+      EXECUTOR_URL: http://executor:8000
+      PHONE_URL: http://phone:8002
+      # Internal server: the elevation state for the executor, the phone
+      # service and host/geba-root.
       INTERNAL_HOST: 0.0.0.0
       DATA_DIR: /app/data
       # Optional PIN asked on the phone when approving a voice request to
@@ -45,43 +47,81 @@ services:
     ports:
       # Published on the VPN address only, as before.
       - "${GATEWAY_BIND:-100.99.129.107}:8443:8443"
+      # host/geba-root asks the elevation level here. Host loopback only.
+      - "127.0.0.1:8001:8001"
     volumes:
       - ./certs:/app/certs:ro
-      - ${HOME}/.claude:/home/app/.claude
       - orchestrator-data:/app/data
       # Tailed into the app's Logs screen.
       - ./command_audit.log:/app/command_audit.log:ro
-    networks: [default, stt, exec]
+    networks: [default, stt, exec, phonelink]
     depends_on:
       whisper:
         condition: service_healthy
       executor:
+        condition: service_healthy
+      phone:
         condition: service_healthy
 
   executor:
     build:
       context: .
       dockerfile: docker/executor.Dockerfile
+      args:
+        HOST_UID: ${HOST_UID:-1000}
     restart: unless-stopped
-    # Your uid/gid: the audit log on the host is yours.
+    # Your uid/gid: Claude writes into your ~/.claude, the audit log on the
+    # host is yours.
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:
-      # Host header the orchestrator sends; anything else is refused.
-      MCP_ALLOWED_HOSTS: "executor:*"
+      # Empty = Claude Code's default; e.g. claude-haiku-5-5
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-}
+      PHONE_MCP_URL: http://phone:8002/mcp
       ELEVATION_URL: http://orchestrator:8001/internal/elevation
       # systemd units to show on the app's Server screen, e.g. "nginx,ssh"
       MONITOR_UNITS: ${MONITOR_UNITS:-}
+      # target "local" = this host, over SSH as geba-exec. Set up once with
+      # `sudo host/setup-host-access.sh` (writes ./ssh).
+      HOST_SSH: host.docker.internal
+      SSH_CONFIG: /app/ssh/config
+      HOST_SCRIPTS_DIR: ${PROJECT_DIR:-${PWD}}/scripts
+      # More nodes: "node2=admin@10.0.0.2,..."
+      CLUSTER_NODES: ${CLUSTER_NODES:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
+      - ${HOME}/.claude:/home/executor/.claude
       - ./commands_whitelist.md:/app/commands_whitelist.md:ro
       - ./scripts:/app/scripts:ro
       - ./command_audit.log:/app/command_audit.log
-      # The node's real name for the Server screen.
+      - ./ssh:/app/ssh:ro
+      # The node's real name for the Server screen (without HOST_SSH).
       - /etc/hostname:/host/hostname:ro
-    # No published ports. Not an internal network, so run_command can still
-    # SSH out to other cluster nodes.
-    networks: [exec]
+    # No published ports. exec is not an internal network: Claude needs the
+    # internet, run_command SSHes to the host and other cluster nodes.
+    networks: [exec, phonelink]
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 2)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  phone:
+    build:
+      context: .
+      dockerfile: docker/phone.Dockerfile
+    restart: unless-stopped
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      # Host header the executor sends to /mcp; anything else is refused.
+      PHONE_ALLOWED_HOSTS: "phone:*"
+      ELEVATION_URL: http://orchestrator:8001/internal/elevation
+      # Apps never driven, added to the phone's own list (comma-separated);
+      # empty = the defaults in phone_hub.py.
+      PHONE_DENY_PACKAGES: ${PHONE_DENY_PACKAGES:-}
+    networks: [phonelink]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health')"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -113,3 +153,5 @@ volumes:
 networks:
   stt:
   exec:
+  phonelink:
+    internal: true

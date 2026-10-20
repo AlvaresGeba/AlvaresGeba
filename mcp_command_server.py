@@ -18,9 +18,19 @@ Run this on each cluster node you want the AI to be able to act on, or run
 it once and have it SSH out to the other node for cluster-wide commands
 (see run_command's `target` argument).
 
-In docker it is its own service (executor) and serves MCP over streamable
-HTTP to the orchestrator: MCP_TRANSPORT=streamable-http. Without that it
-speaks stdio, for local testing.
+In docker the container is not the server, so target "local" goes over SSH
+to the host (HOST_SSH) as the account geba-exec - see
+host/setup-host-access.sh. There the elevation level also decides who runs
+the command:
+    normal/elevated  geba-exec; the whitelisted commands that need root
+                     (ROOT_COMMANDS) get "sudo -n", which
+                     host/sudoers.geba-exec allows for those only
+    unrestricted     root, through geba-root - which asks the orchestrator
+                     for the level itself before running anything
+
+Claude Code in the executor container starts it per task over stdio (see
+command_router.mcp_config). MCP_TRANSPORT=streamable-http serves it over
+HTTP instead, for running it standalone.
 
 Requires: pip install "mcp[cli]" pyyaml
 """
@@ -30,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import logging
 import urllib.request
@@ -53,9 +64,12 @@ WHITELIST_MD = BASE_DIR / "commands_whitelist.md"
 SCRIPTS_DIR = BASE_DIR / "scripts"
 LOG_FILE = BASE_DIR / "command_audit.log"
 
-# Read-only view of the orchestrator's elevation state. Unset or
-# unreachable = "normal" (fail closed).
+# The orchestrator's elevation state: GET = status, POST .../request = ask
+# the phone to lift the restrictions. Unset or unreachable = "normal"
+# (fail closed).
 ELEVATION_URL = os.environ.get("ELEVATION_URL", "")
+# Which device the current task came from (set per task by command_router).
+REQUEST_DEVICE_ID = os.environ.get("REQUEST_DEVICE_ID", "") or "unknown"
 
 # Units shown on the app's Server screen (systemd nodes only).
 MONITOR_UNITS = [u for u in os.environ.get("MONITOR_UNITS", "").split(",") if u]
@@ -63,12 +77,28 @@ MONITOR_UNITS = [u for u in os.environ.get("MONITOR_UNITS", "").split(",") if u]
 # reported by its real name, not the container id.
 HOST_HOSTNAME_FILE = Path(os.environ.get("HOST_HOSTNAME_FILE", "/host/hostname"))
 
-# Known cluster nodes this server is allowed to reach over SSH.
-# Add your real hostnames/IPs here. Keys used as the `target` argument.
+# The server this executor manages, over SSH (in docker:
+# "host.docker.internal"). Empty = run commands right here.
+HOST_SSH = os.environ.get("HOST_SSH", "")
+# ssh client config with the key and known_hosts (written by
+# host/setup-host-access.sh, mounted at /app/ssh).
+SSH_CONFIG = os.environ.get("SSH_CONFIG", "")
+# Where scripts/ is on the host, for run_script over SSH.
+HOST_SCRIPTS_DIR = os.environ.get("HOST_SCRIPTS_DIR", "")
+
+# Known cluster nodes this server is allowed to reach over SSH. Keys are the
+# `target` argument; more nodes via CLUSTER_NODES="node2=admin@10.0.0.2,...".
 CLUSTER_NODES: dict[str, str] = {
-    "local": "",  # empty = run on this machine directly
-    # "node2": "admin@10.0.0.2",
+    "local": HOST_SSH,  # this server; empty = this machine directly
+    **dict(item.split("=", 1) for item in os.environ.get("CLUSTER_NODES", "").split(",")
+           if "=" in item),
 }
+
+# Whitelisted commands that need root on the host: run with "sudo -n".
+# host/sudoers.geba-exec allows exactly these - keep the two in step.
+ROOT_COMMANDS = re.compile(r"^(docker\s|systemctl\s+(restart|stop)\s|reboot$)")
+# Root for anything else, only while "unrestricted" (see host/geba-root).
+GEBA_ROOT = "/usr/local/lib/geba/geba-root"
 
 # Only our own audit records go to the file, not the MCP library's
 # per-request chatter.
@@ -128,12 +158,21 @@ def _load_whitelist() -> dict[str, list[Rule]]:
     return result
 
 
-def _elevation_level() -> str:
+def _elevation_call(path: str = "", body: dict | None = None) -> dict:
     if not ELEVATION_URL:
-        return "normal"
+        raise RuntimeError("ELEVATION_URL is not set")
+    request = urllib.request.Request(
+        ELEVATION_URL + path,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"content-type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=3) as resp:
+        return json.load(resp)
+
+
+def _elevation_level() -> str:
     try:
-        with urllib.request.urlopen(ELEVATION_URL, timeout=2) as resp:
-            level = json.load(resp).get("level", "normal")
+        level = _elevation_call().get("level", "normal")
     except Exception:  # noqa: BLE001 - unreachable orchestrator = no elevation
         logger.warning("Elevation lookup failed - treating as normal")
         return "normal"
@@ -169,13 +208,33 @@ def _classify(command: str, level: str = "normal") -> tuple[Literal["allow", "co
         return "allow", "No matching rule - allowed because restrictions are lifted (unrestricted)"
     return "unknown", "No matching rule - rejected by default (fail closed)"
 
-def _run(command: str, target: str) -> dict:
+def _ssh(host: str, command: str) -> list[str]:
+    # LogLevel=ERROR: no sshd banner in every result.
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR"]
+    if SSH_CONFIG:
+        cmd += ["-F", SSH_CONFIG]
+    return cmd + [host, command]
+
+
+def _on_host(command: str, level: str) -> str:
+    """Who runs the command on the host (see the module docstring)."""
+    if level == "unrestricted":
+        return f"sudo -n {GEBA_ROOT} {shlex.quote(command)}"
+    if ROOT_COMMANDS.match(command):
+        return f"sudo -n {command}"
+    return command
+
+
+def _run(command: str, target: str, level: str = "normal") -> dict:
     """Actually execute a command, locally or over SSH to a cluster node."""
-    if target and target != "local":
-        host = CLUSTER_NODES.get(target)
-        if host is None:
-            return {"error": f"Unknown cluster target '{target}'"}
-        full_cmd = ["ssh", "-o", "BatchMode=yes", host, command]
+    target = target or "local"
+    host = CLUSTER_NODES.get(target)
+    if host is None:
+        return {"error": f"Unknown cluster target '{target}'"}
+    if host:
+        if target == "local":
+            command = _on_host(command, level)
+        full_cmd = _ssh(host, command)
     else:
         full_cmd = ["/bin/sh", "-c", command]
 
@@ -205,7 +264,9 @@ def list_allowed_commands() -> str:
     lines += [f"  - {r.pattern}  # {r.description}" for r in rules["allow"]]
     lines.append("\nREQUIRES confirm=True:")
     lines += [f"  - {r.pattern}  # {r.description}" for r in rules["confirm"]]
-    lines.append("\nAvailable cluster targets: " + ", ".join(CLUSTER_NODES))
+    lines.append("\nAvailable cluster targets: " + ", ".join(CLUSTER_NODES)
+                 + ' ("local" is this server itself)')
+    lines.append("Never prefix commands with sudo: root is used automatically where allowed.")
     return "\n".join(lines)
 
 
@@ -215,7 +276,7 @@ def run_command(command: str, target: str = "local", confirm: bool = False) -> d
 
     Args:
         command: the exact shell command to run.
-        target: which cluster node to run it on ("local" or a name from
+        target: which cluster node to run it on ("local" = this server, or a name from
             list_allowed_commands' cluster target list).
         confirm: must be True to execute anything classified as "confirm"
             risk level. Has no effect on "allow" or "deny" commands.
@@ -244,7 +305,7 @@ def run_command(command: str, target: str = "local", confirm: bool = False) -> d
                       "Call again with confirm=True if you are sure.",
         }
 
-    result = _run(command, target)
+    result = _run(command, target, level)
     logger.info("EXECUTED target=%s command=%r result=%s", target, command, result)
     return {"executed": True, **result}
 
@@ -266,11 +327,13 @@ def run_script(script_name: str, args: list[str] | None = None, target: str = "l
         return {"executed": False, "reason": f"No such script: {script_name}"}
 
     args = args or []
-    quoted_args = " ".join(f"'{a}'" for a in args)
-    command = f"{script_path} {quoted_args}".strip()
+    if (target or "local") == "local" and HOST_SSH and HOST_SCRIPTS_DIR:
+        script_path = Path(HOST_SCRIPTS_DIR) / script_path.relative_to(SCRIPTS_DIR.resolve())
+    command = shlex.join([str(script_path), *args])
 
-    logger.info("SCRIPT target=%s script=%s args=%s", target, script_name, args)
-    result = _run(command, target)
+    level = _elevation_level()
+    logger.info("SCRIPT target=%s script=%s args=%s level=%s", target, script_name, args, level)
+    result = _run(command, target, level)
     logger.info("SCRIPT_RESULT script=%s result=%s", script_name, result)
     return {"executed": True, **result}
 
@@ -284,6 +347,8 @@ def get_system_status(target: str = "local") -> dict:
 
 
 def _local_metrics() -> dict:
+    if HOST_SSH:
+        return _remote_metrics("local", HOST_SSH)
     in_docker = Path("/.dockerenv").exists()
     hostname = None
     if HOST_HOSTNAME_FILE.is_file():
@@ -305,10 +370,10 @@ def _local_metrics() -> dict:
 
 def _remote_metrics(name: str, host: str) -> dict:
     script = Path(node_metrics.__file__).read_text()
-    env = f"NODE_NAME={name} MONITOR_UNITS={','.join(MONITOR_UNITS)}"
+    env = f"NODE_NAME={shlex.quote(name)} MONITOR_UNITS={shlex.quote(','.join(MONITOR_UNITS))}"
     try:
         proc = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, f"{env} python3 -"],
+            _ssh(host, f"{env} python3 -"),
             input=script, capture_output=True, text=True, timeout=20,
         )
         if proc.returncode != 0:
@@ -331,6 +396,35 @@ def get_metrics(include_remote: bool = True) -> list[dict]:
         nodes += [_remote_metrics(name, host) for name, host in CLUSTER_NODES.items()
                   if name != "local" and host]
     return nodes
+
+
+@mcp.tool()
+def elevation_status() -> dict:
+    """Current restriction level (normal / elevated / unrestricted),
+    time left, and requests waiting for approval on the phone."""
+    try:
+        return _elevation_call()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"orchestrator unreachable: {exc}"}
+
+
+@mcp.tool()
+def request_elevation(level: str, minutes: int, reason: str) -> dict:
+    """Ask for the command restrictions to be lifted for a while.
+    level: "elevated" (commands that need confirmation stop asking) or
+    "unrestricted" (commands outside the whitelist are allowed too, as root
+    on this server; deny rules still apply). Use ONLY when the user
+    explicitly asked to lift restrictions. Nothing changes until the user
+    approves the request on the phone; tell them to confirm it there and
+    quote the code."""
+    try:
+        result = _elevation_call("/request", {"level": level, "minutes": minutes,
+                                              "reason": reason, "device_id": REQUEST_DEVICE_ID})
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"orchestrator unreachable: {exc}"}
+    logger.warning("ELEVATION_REQUEST level=%s minutes=%s device=%s reason=%r result=%s",
+                   level, minutes, REQUEST_DEVICE_ID, reason, result)
+    return result
 
 
 if __name__ == "__main__":

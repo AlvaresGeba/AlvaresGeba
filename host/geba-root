@@ -1,0 +1,49 @@
+#!/usr/bin/python3 -I
+"""
+geba-root - runs one shell command as root, but only while the restrictions
+are lifted to "unrestricted" from the phone.
+
+Installed by host/setup-host-access.sh as /usr/local/lib/geba/geba-root
+(root-owned); host/sudoers.geba-exec lets the executor's account run it.
+
+The level is asked from the orchestrator itself (its internal port,
+published on 127.0.0.1 only), never taken from the caller: even an
+executor that has been taken over cannot claim "unrestricted" on its own.
+Orchestrator down or level lower = refused.
+
+    sudo -n /usr/local/lib/geba/geba-root 'apt-get update'
+"""
+
+import json
+import os
+import sys
+import syslog
+import urllib.request
+
+ELEVATION_URL = "http://127.0.0.1:8001/internal/elevation"
+
+
+def level() -> str:
+    try:
+        with urllib.request.urlopen(ELEVATION_URL, timeout=2) as resp:
+            return json.load(resp).get("level", "normal")
+    except Exception:  # noqa: BLE001 - unreachable = not lifted
+        return "unknown"
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        sys.exit("usage: geba-root '<command>'")
+    command = sys.argv[1]
+    current = level()
+    syslog.openlog("geba-root", 0, syslog.LOG_AUTH)
+    if current != "unrestricted":
+        syslog.syslog(syslog.LOG_WARNING, f"refused (level={current}): {command!r}")
+        print(f"geba-root: restrictions are not lifted (level={current})", file=sys.stderr)
+        sys.exit(126)
+    syslog.syslog(syslog.LOG_NOTICE, f"running as root: {command!r}")
+    os.execv("/bin/sh", ["/bin/sh", "-c", command])
+
+
+if __name__ == "__main__":
+    main()

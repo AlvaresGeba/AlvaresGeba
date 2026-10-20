@@ -14,20 +14,18 @@ from mcp.client.stdio import stdio_client
 
 import command_router
 import mcp_command_server
-from command_router import MCP_CONFIG, handle_text_command, mcp_config, parse_stream, split_reply
+from command_router import handle_text_command, mcp_config, parse_stream, split_reply
 
 SERVER_SCRIPT = Path(mcp_command_server.__file__)
 
 
 class McpConfigTests(unittest.TestCase):
-    def test_config_points_claude_at_executor_and_phone_over_http(self) -> None:
-        self.assertEqual(
-            MCP_CONFIG["mcpServers"]["cluster"],
-            {"type": "http", "url": command_router.EXECUTOR_URL},
-        )
-        phone = mcp_config("abc")["mcpServers"]["phone"]
-        self.assertEqual(phone["url"], command_router.PHONE_MCP_URL)
-        self.assertEqual(phone["headers"], {"X-Request-Id": "abc"})
+    def test_cluster_tools_local_phone_tools_over_http(self) -> None:
+        servers = mcp_config("pixel")["mcpServers"]
+        self.assertEqual(servers["cluster"]["type"], "stdio")
+        self.assertEqual(servers["cluster"]["args"], [str(SERVER_SCRIPT)])
+        self.assertEqual(servers["cluster"]["env"], {"REQUEST_DEVICE_ID": "pixel"})
+        self.assertEqual(servers["phone"], {"type": "http", "url": command_router.PHONE_MCP_URL})
 
     def test_server_exposes_cluster_tools(self) -> None:
         async def list_tools() -> set[str]:
@@ -39,7 +37,8 @@ class McpConfigTests(unittest.TestCase):
 
         self.assertEqual(
             anyio.run(list_tools),
-            {"list_allowed_commands", "run_command", "run_script", "get_system_status", "get_metrics"},
+            {"list_allowed_commands", "run_command", "run_script", "get_system_status", "get_metrics",
+             "elevation_status", "request_elevation"},
         )
 
 
@@ -90,6 +89,45 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual(mcp_command_server._elevation_level(), "normal")
 
 
+class HostTargetTests(unittest.TestCase):
+    """target "local" over SSH to the host: who runs what."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(mcp_command_server.CLUSTER_NODES, {"local": "host.docker.internal"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        run_patcher = mock.patch.object(
+            mcp_command_server.subprocess, "run",
+            return_value=mock.Mock(returncode=0, stdout="", stderr=""))
+        self.run_mock = run_patcher.start()
+        self.addCleanup(run_patcher.stop)
+
+    def remote_command(self, command: str, level: str) -> str:
+        mcp_command_server._run(command, "local", level)
+        argv = self.run_mock.call_args.args[0]
+        self.assertEqual((argv[0], argv[-2]), ("ssh", "host.docker.internal"))
+        return argv[-1]
+
+    def test_plain_commands_run_as_geba_exec(self) -> None:
+        self.assertEqual(self.remote_command("df -h", "normal"), "df -h")
+        self.assertEqual(self.remote_command("systemctl status ssh", "elevated"), "systemctl status ssh")
+
+    def test_root_commands_get_sudo(self) -> None:
+        self.assertEqual(self.remote_command("systemctl restart nginx", "normal"),
+                         "sudo -n systemctl restart nginx")
+        self.assertEqual(self.remote_command("docker ps", "elevated"), "sudo -n docker ps")
+        self.assertEqual(self.remote_command("reboot", "elevated"), "sudo -n reboot")
+
+    def test_unrestricted_goes_through_geba_root(self) -> None:
+        self.assertEqual(self.remote_command("apt-get update && echo 'ok'", "unrestricted"),
+                         "sudo -n /usr/local/lib/geba/geba-root 'apt-get update && echo '\"'\"'ok'\"'\"''")
+
+    def test_other_nodes_untouched(self) -> None:
+        with mock.patch.dict(mcp_command_server.CLUSTER_NODES, {"node2": "admin@10.0.0.2"}):
+            mcp_command_server._run("reboot", "node2", "unrestricted")
+        self.assertEqual(self.run_mock.call_args.args[0][-1], "reboot")
+
+
 class FakeClaude:
     """Writes a stand-in `claude` executable that records how it was called
     and prints `reply` as its JSON result."""
@@ -135,7 +173,7 @@ class HandleTextCommandTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
         self.assertIn("--strict-mcp-config", argv)
         self.assertEqual(argv[argv.index("--setting-sources") + 1], "project")
-        self.assertEqual(json.loads(argv[argv.index("--mcp-config") + 1]), MCP_CONFIG)
+        self.assertEqual(json.loads(argv[argv.index("--mcp-config") + 1]), mcp_config(""))
 
     def test_claude_error_result_raises(self) -> None:
         fake = FakeClaude({"type": "result", "is_error": True, "result": "Invalid API key"}, exit_code=1)

@@ -1,0 +1,4 @@
+# Phone container: phone_service.py + phone_hub.py. mcp pinned below 2.0
+# like the executor (see requirements-executor.txt).
+mcp[cli]>=1.23,<2.0
+uvicorn[standard]>=0.29

@@ -4,7 +4,8 @@ phone_hub.py
 The phone as a set of tools for Claude.
 
 The app (PhoneAgentService) keeps a WebSocket open to gateway /phone/ws,
-with the same mTLS client certificate as every other call:
+with the same mTLS client certificate as every other call; the gateway
+relays it to phone_service.py, where this runs:
 
     phone  -> server  {"type": "hello", "device_id": "pixel-10a"}
     server -> phone   {"type": "action", "id": "...", "action": "tap",
@@ -14,9 +15,7 @@ with the same mTLS client certificate as every other call:
 
 PhoneHub tracks the connected phones and turns an action into an awaitable
 call. build_phone_mcp() wraps it as the "phone" MCP server that Claude
-Code gets next to the executor's "cluster" server. It is served only on
-127.0.0.1 inside the orchestrator (see gateway.py) - the phone is driven by
-Claude, never directly by anything on the docker networks.
+Code in the executor gets next to its "cluster" server.
 
 The phone has its own hardcoded app deny-list (PhonePolicy) that the
 server can only add to; PHONE_DENY_PACKAGES is that addition.
@@ -31,13 +30,11 @@ import os
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
-from fastapi import WebSocket, WebSocketDisconnect
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-
-from elevation import Elevation, ElevationError
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 logger = logging.getLogger("phone_hub")
 
@@ -60,8 +57,8 @@ DEFAULT_DENY_PACKAGES = [
     "kz.forte.bank",
     "com.paypal.android.p2pmobile",
 ]
-DENY_PACKAGES = [p.strip() for p in os.environ.get(
-    "PHONE_DENY_PACKAGES", ",".join(DEFAULT_DENY_PACKAGES)).split(",") if p.strip()]
+DENY_PACKAGES = [p.strip() for p in (os.environ.get("PHONE_DENY_PACKAGES")
+                                     or ",".join(DEFAULT_DENY_PACKAGES)).split(",") if p.strip()]
 
 # A disconnected phone is still listed (with its last-seen age) this long.
 FORGET_AFTER_S = 3600
@@ -191,24 +188,23 @@ class PhoneHub:
 # The "phone" MCP server
 # ---------------------------------------------------------------------------
 
-def build_phone_mcp(hub: PhoneHub, elevation: Elevation, requests: dict[str, dict]) -> FastMCP:
-    """`requests` maps the X-Request-Id header (set per command in the MCP
-    config, see command_router.py) to {"device_id": ...} - which device the
-    command came from, for request_elevation."""
+def build_phone_mcp(hub: PhoneHub, elevation_level: Callable[[], str],
+                    allowed_hosts: list[str] | None = None) -> FastMCP:
+    """elevation_level() -> "normal" / "elevated" / "unrestricted" (blocking;
+    it asks the orchestrator). allowed_hosts: Host headers accepted besides
+    loopback, e.g. ["phone:*"]."""
 
     mcp = FastMCP(
         "phone",
         stateless_http=True,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=["127.0.0.1:*", "localhost:*"],
+            allowed_hosts=(allowed_hosts or []) + ["127.0.0.1:*", "localhost:*"],
         ),
     )
 
-    def origin(ctx: Context) -> dict:
-        request = getattr(ctx.request_context, "request", None)
-        rid = request.headers.get("x-request-id", "") if request is not None else ""
-        return requests.get(rid, {})
+    async def lifted() -> bool:
+        return await asyncio.to_thread(elevation_level) != "normal"
 
     async def run(action: str, args: dict | None = None, device_id: str | None = None) -> dict:
         logger.info("phone action %s %s", action, args or {})
@@ -319,7 +315,7 @@ def build_phone_mcp(hub: PhoneHub, elevation: Elevation, requests: dict[str, dic
         """Send an SMS. Needs confirm=true - set it ONLY if the user clearly
         confirmed sending this exact message to this number (unless
         restrictions are lifted)."""
-        if not confirm and elevation.level() == "normal":
+        if not confirm and not await lifted():
             return {"ok": False, "needs_confirmation": True,
                     "error": f"Sending an SMS to {number} requires confirmation. "
                              "Call again with confirm=true if the user confirmed."}
@@ -329,34 +325,10 @@ def build_phone_mcp(hub: PhoneHub, elevation: Elevation, requests: dict[str, dic
     async def call(number: str, confirm: bool = False, device_id: str = "") -> dict:
         """Place a phone call. Needs confirm=true - set it ONLY if the user
         clearly asked to call this number (unless restrictions are lifted)."""
-        if not confirm and elevation.level() == "normal":
+        if not confirm and not await lifted():
             return {"ok": False, "needs_confirmation": True,
                     "error": f"Calling {number} requires confirmation. "
                              "Call again with confirm=true if the user confirmed."}
         return await run("call", {"number": number}, device_id)
-
-    @mcp.tool()
-    async def elevation_status() -> dict:
-        """Current restriction level (normal / elevated / unrestricted),
-        time left, and requests waiting for approval on the phone."""
-        return elevation.status()
-
-    @mcp.tool()
-    async def request_elevation(level: str, minutes: int, reason: str, ctx: Context) -> dict:
-        """Ask for the command restrictions to be lifted for a while.
-        level: "elevated" (commands that need confirmation stop asking) or
-        "unrestricted" (commands outside the whitelist are allowed too; deny
-        rules still apply). Use ONLY when the user explicitly asked to lift
-        restrictions. Nothing changes until the user approves the request on
-        the phone; tell them to confirm it there and quote the code."""
-        device_id = origin(ctx).get("device_id", "unknown")
-        try:
-            challenge = elevation.request(level, minutes * 60, reason, device_id)
-        except ElevationError as exc:
-            return {"ok": False, "error": str(exc)}
-        logger.warning("Elevation requested: level=%s ttl=%ss device=%s code=%s reason=%r",
-                       challenge.level, challenge.ttl_s, device_id, challenge.code, challenge.reason)
-        return {"ok": True, "pending": True, "code": challenge.code,
-                "message": "Waiting for approval in the phone app (expires in 2 min)."}
 
     return mcp

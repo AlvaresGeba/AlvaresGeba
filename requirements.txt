@@ -2,4 +2,5 @@
 # its own file.
 -r requirements-orchestrator.txt
 -r requirements-executor.txt
+-r requirements-phone.txt
 -r requirements-stt.txt

@@ -1,15 +1,20 @@
 import asyncio
 import json
+import socket
+import threading
 import time
 import unittest
 from unittest import mock
 
+import uvicorn
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import executor_agent
 import gateway
 import node_metrics
 import phone_hub
+import phone_service
 from command_router import CommandOutcome
 from elevation import CHALLENGE_TTL_S, Elevation, ElevationError
 from phone_hub import PhoneError, PhoneHub
@@ -144,8 +149,8 @@ class PhoneHubTests(unittest.TestCase):
     def test_sms_needs_confirmation_unless_elevated(self) -> None:
         async def scenario():
             hub = PhoneHub()
-            elevation = Elevation()
-            mcp = phone_hub.build_phone_mcp(hub, elevation, {})
+            level = {"now": "normal"}
+            mcp = phone_hub.build_phone_mcp(hub, lambda: level["now"])
             ws = FakeSocket("pixel", lambda m: {"ok": True, "result": "sms sent"})
             serving = asyncio.create_task(hub.serve(ws))
             await asyncio.sleep(0.01)
@@ -158,7 +163,7 @@ class PhoneHubTests(unittest.TestCase):
             self.assertTrue((await send())["needs_confirmation"])
             self.assertEqual(ws.sent, [])
             self.assertTrue((await send(confirm=True))["ok"])
-            elevation.lift("elevated", 60, "", "pixel")
+            level["now"] = "elevated"
             self.assertTrue((await send())["ok"])
             ws.incoming.put_nowait(None)
             await serving
@@ -199,11 +204,13 @@ class GatewayApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/elevation").json()["pending"], [])
 
     def test_command_history_and_logs(self) -> None:
-        outcome = CommandOutcome("OK: 12% used", "OK: 12% used\n\n/ 12%",
-                                 [{"tool": "cluster.run_command", "args": {"command": "df -h"},
-                                   "ok": True, "result": "..."}])
-        with mock.patch.object(gateway, "handle_text_command", mock.AsyncMock(return_value=outcome)):
+        outcome = {"short": "OK: 12% used", "detail": "OK: 12% used\n\n/ 12%",
+                   "steps": [{"tool": "cluster.run_command", "args": {"command": "df -h"},
+                              "ok": True, "result": "..."}],
+                   "needs_confirmation": False}
+        with mock.patch.object(gateway, "dispatch", mock.AsyncMock(return_value=outcome)) as dispatch:
             reply = self.client.post("/command", json={"text": "диск", "device_id": "pixel"}).json()
+        self.assertEqual(dispatch.await_args.args[0::2], ("диск", "pixel"))
         self.assertEqual((reply["result"], len(reply["steps"])), ("OK: 12% used", 1))
 
         [entry] = self.client.get("/history/recent?q=диск").json()["requests"]
@@ -217,38 +224,163 @@ class GatewayApiTests(unittest.TestCase):
         self.assertTrue(any("диск" in e["msg"] for e in logs))
         self.assertFalse(self.client.get("/logs/recent?level=CRITICAL&q=диск").json()["entries"])
 
-    def test_monitor_without_executor(self) -> None:
-        with mock.patch.object(gateway, "executor_session_call",
-                               mock.AsyncMock(side_effect=ConnectionError("down"))):
+    def test_task_goes_to_the_executor_agent(self) -> None:
+        sent = []
+
+        def agent(request):
+            sent.append(request)
+            if request.url.path == "/task":
+                return gateway.httpx.Response(200, json={"short": "OK", "detail": "OK", "steps": [],
+                                                         "needs_confirmation": False})
+            return gateway.httpx.Response(502, json={"detail": "claude exited with 1"})
+
+        real_client = gateway.httpx.AsyncClient
+        fake = lambda **kw: real_client(transport=gateway.httpx.MockTransport(agent), **kw)
+        with mock.patch.object(gateway.httpx, "AsyncClient", fake):
+            result = asyncio.run(gateway.dispatch("uptime", "r1", "pixel"))
+            self.assertEqual(result["short"], "OK")
+            self.assertEqual(str(sent[0].url), f"{gateway.AGENTS['executor']}/task")
+            self.assertEqual(json.loads(sent[0].content),
+                             {"text": "uptime", "request_id": "r1", "device_id": "pixel"})
+            with mock.patch.dict(gateway.AGENTS, {"executor": "http://broken"}):
+                sent.clear()
+                agent_failing = lambda r: gateway.httpx.Response(502, json={"detail": "claude exited with 1"})
+                fake2 = lambda **kw: real_client(transport=gateway.httpx.MockTransport(agent_failing), **kw)
+                with mock.patch.object(gateway.httpx, "AsyncClient", fake2):
+                    with self.assertRaisesRegex(RuntimeError, "executor: claude exited with 1"):
+                        asyncio.run(gateway.dispatch("uptime", "r2", "pixel"))
+
+    def test_monitor_without_services(self) -> None:
+        with mock.patch.object(gateway, "service_get", mock.AsyncMock(side_effect=ConnectionError("down"))):
             snap = self.client.get("/monitor?remote=false").json()
         self.assertFalse(snap["nodes"][0]["ok"])
-        self.assertEqual(snap["gateway"]["mcp_servers"], ["cluster", "phone"])
+        self.assertEqual((snap["gateway"]["phones"], snap["gateway"]["agents"]), ({}, ["executor"]))
 
-    def test_tools_include_phone(self) -> None:
-        with mock.patch.object(gateway, "executor_session_call",
-                               mock.AsyncMock(side_effect=ConnectionError("down"))):
-            tools = self.client.get("/agent/tools").json()["tools"]
-        names = {(t["server"], t["name"]) for t in tools}
-        self.assertIn(("phone", "read_screen"), names)
-        self.assertIn(("phone", "request_elevation"), names)
+    def test_monitor_collects_from_services(self) -> None:
+        answers = {
+            f"{gateway.AGENTS['executor']}/metrics?remote=false": [{"node": "local", "ok": True}],
+            f"{gateway.PHONE_URL}/phones": {"pixel": {"connected": True}},
+            f"{gateway.AGENTS['executor']}/info": {"model": "claude-haiku-5-5", "mcp_servers": ["cluster", "phone"]},
+        }
+        with mock.patch.object(gateway, "service_get",
+                               mock.AsyncMock(side_effect=lambda url, timeout=12: answers[url])):
+            snap = self.client.get("/monitor?remote=false").json()
+        self.assertTrue(snap["nodes"][0]["ok"])
+        self.assertEqual(snap["gateway"]["phones"], {"pixel": {"connected": True}})
+        self.assertEqual(snap["gateway"]["model"], "claude-haiku-5-5")
 
-    def test_phone_websocket(self) -> None:
-        with self.client.websocket_connect("/phone/ws") as ws:
-            ws.send_text(json.dumps({"type": "hello", "device_id": "pixel-test"}))
-            for _ in range(50):
-                if "pixel-test" in gateway.phones.connected():
-                    break
-                time.sleep(0.01)
-            self.assertIn("pixel-test", gateway.phones.connected())
-        snap_phones = gateway.phones.links()
-        self.assertIn("pixel-test", snap_phones)
+    def test_tools_come_from_the_agents(self) -> None:
+        tools = [{"server": "phone", "name": "read_screen", "description": ""}]
+        with mock.patch.object(gateway, "service_get", mock.AsyncMock(return_value={"tools": tools})):
+            self.assertEqual(self.client.get("/agent/tools").json()["tools"], tools)
+        with mock.patch.object(gateway, "service_get", mock.AsyncMock(side_effect=ConnectionError())):
+            self.assertEqual(self.client.get("/agent/tools").json()["tools"], [])
 
 
 class InternalServerTests(unittest.TestCase):
-    def test_elevation_readable_mcp_loopback_only(self) -> None:
-        with TestClient(gateway.build_internal_app()) as client:  # client host = "testclient"
-            self.assertEqual(client.get("/internal/elevation").json(), {"level": "normal"})
-            self.assertEqual(client.post("/mcp", json={}).status_code, 403)
+    def test_elevation_read_and_request(self) -> None:
+        with mock.patch.object(gateway, "elevation", Elevation()):
+            client = TestClient(gateway.build_internal_app())
+            self.assertEqual(client.get("/internal/elevation").json()["level"], "normal")
+            asked = client.post("/internal/elevation/request", json={
+                "level": "unrestricted", "minutes": 5, "reason": "apt", "device_id": "pixel"}).json()
+            self.assertTrue(asked["pending"])
+            status = client.get("/internal/elevation").json()
+            # Asking lifts nothing: only the phone grants it.
+            self.assertEqual((status["level"], status["pending"][0]["code"]), ("normal", asked["code"]))
+            bad = client.post("/internal/elevation/request", json={"level": "root", "minutes": 5}).json()
+            self.assertFalse(bad["ok"])
+
+
+class ExecutorAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(executor_agent.app)
+
+    def test_task_runs_claude(self) -> None:
+        outcome = CommandOutcome("OK: up", "OK: up\n\n3 days", [{"tool": "cluster.run_command"}])
+        with mock.patch.object(executor_agent, "handle_text_command",
+                               mock.AsyncMock(return_value=outcome)) as claude:
+            reply = self.client.post("/task", json={"text": "uptime", "request_id": "r1",
+                                                    "device_id": "pixel"}).json()
+        self.assertEqual(claude.await_args.args, ("uptime", "pixel"))
+        self.assertEqual(reply, {"short": "OK: up", "detail": "OK: up\n\n3 days",
+                                 "steps": [{"tool": "cluster.run_command"}], "needs_confirmation": False})
+
+    def test_task_failure_is_502(self) -> None:
+        with mock.patch.object(executor_agent, "handle_text_command",
+                               mock.AsyncMock(side_effect=RuntimeError("not logged in"))):
+            response = self.client.post("/task", json={"text": "uptime"})
+        self.assertEqual((response.status_code, response.json()["detail"]), (502, "not logged in"))
+
+    def test_tools_list_cluster_and_phone(self) -> None:
+        phone_tools = asyncio.run(phone_hub.build_phone_mcp(PhoneHub(), lambda: "normal").list_tools())
+        with mock.patch.object(executor_agent, "phone_tools", mock.AsyncMock(return_value=phone_tools)):
+            names = {(t["server"], t["name"]) for t in self.client.get("/tools").json()["tools"]}
+        self.assertIn(("cluster", "run_command"), names)
+        self.assertIn(("cluster", "request_elevation"), names)
+        self.assertIn(("phone", "read_screen"), names)
+        with mock.patch.object(executor_agent, "phone_tools", mock.AsyncMock(side_effect=ConnectionError())):
+            names = {t["server"] for t in self.client.get("/tools").json()["tools"]}
+        self.assertEqual(names, {"cluster"})
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class PhoneServiceTests(unittest.TestCase):
+    def test_phone_connects_and_is_listed(self) -> None:
+        # No `with`: the MCP session manager's lifespan may run only once per
+        # process, and the relay test below needs it.
+        client = TestClient(phone_service.app)
+        with client.websocket_connect("/phone/ws") as ws:
+            ws.send_text(json.dumps({"type": "hello", "device_id": "pixel-test"}))
+            for _ in range(50):
+                if "pixel-test" in phone_service.hub.connected():
+                    break
+                time.sleep(0.01)
+            self.assertIn("pixel-test", client.get("/health").json()["connected"])
+        self.assertIn("pixel-test", client.get("/phones").json())
+
+    def test_gateway_relays_the_phone_socket(self) -> None:
+        """Real phone service on a port, the gateway's /phone/ws in front."""
+        port = free_port()
+        server = uvicorn.Server(uvicorn.Config(phone_service.app, host="127.0.0.1", port=port,
+                                               log_level="warning"))
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_until_complete, args=(server.serve(),), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(setattr, server, "should_exit", True)
+        for _ in range(200):
+            if server.started:
+                break
+            time.sleep(0.01)
+
+        hub = phone_service.hub
+        with mock.patch.object(gateway, "PHONE_WS_URL", f"ws://127.0.0.1:{port}/phone/ws"), \
+                TestClient(gateway.app).websocket_connect("/phone/ws") as ws:
+            ws.send_text(json.dumps({"type": "hello", "device_id": "pixel-relay"}))
+            for _ in range(200):
+                if "pixel-relay" in hub.connected():
+                    break
+                time.sleep(0.01)
+            self.assertIn("pixel-relay", hub.connected())
+
+            call = asyncio.run_coroutine_threadsafe(hub.call("status", device_id="pixel-relay", timeout=5), loop)
+            action = json.loads(ws.receive_text())
+            self.assertEqual(action["action"], "status")
+            ws.send_text(json.dumps({"type": "result", "id": action["id"], "ok": True,
+                                     "result": {"battery": 55}}))
+            self.assertEqual(call.result(5), {"battery": 55})
+
+        for _ in range(200):
+            if "pixel-relay" not in hub.connected():
+                break
+            time.sleep(0.01)
+        self.assertNotIn("pixel-relay", hub.connected())
 
 
 class NodeMetricsTests(unittest.TestCase):

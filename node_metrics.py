@@ -117,12 +117,16 @@ def network():
 def docker_containers():
     if not shutil.which("docker"):
         return None
-    try:
-        proc = subprocess.run(["docker", "ps", "-a", "--format", "{{json .}}"],
-                              capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
+    cmd = ["docker", "ps", "-a", "--format", "{{json .}}"]
+    # Not in the docker group (geba-exec): host/sudoers.geba-exec allows this one.
+    for attempt in (cmd, ["sudo", "-n"] + cmd):
+        try:
+            proc = subprocess.run(attempt, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0:
+            break
+    else:
         return None
     out = []
     for line in proc.stdout.splitlines():
