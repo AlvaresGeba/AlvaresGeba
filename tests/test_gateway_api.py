@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import socket
 import threading
 import time
@@ -332,11 +333,52 @@ class InternalServerTests(unittest.TestCase):
             bad = client.post("/internal/elevation/request", json={"level": "root", "minutes": 5}).json()
             self.assertFalse(bad["ok"])
 
-    def test_metrics_only_on_the_internal_server(self) -> None:
-        response = TestClient(gateway.build_internal_app()).get("/metrics")
+    def test_metrics_only_on_the_metrics_server(self) -> None:
+        metrics = TestClient(gateway.build_metrics_app())
+        response = metrics.get("/metrics")
         self.assertEqual(response.status_code, 200)
         self.assertIn("geba_request_duration_seconds", response.text)
+        # Nothing else there, the elevation endpoints included.
+        self.assertEqual(metrics.get("/internal/elevation").status_code, 404)
+        self.assertEqual(metrics.post("/internal/elevation/request",
+                                      json={"level": "elevated", "minutes": 5}).status_code, 404)
+        self.assertEqual(metrics.get("/docs").status_code, 404)
+        self.assertEqual(metrics.get("/openapi.json").status_code, 404)
+        self.assertEqual(TestClient(gateway.build_internal_app()).get("/metrics").status_code, 404)
         self.assertEqual(TestClient(gateway.app).get("/metrics").status_code, 404)
+
+    def test_internal_server_refuses_denied_subnets(self) -> None:
+        with mock.patch.object(gateway, "elevation", Elevation()), \
+                mock.patch.dict(os.environ, {"INTERNAL_DENY_SUBNETS": "172.31.250.0/28, 10.9.0.0/16"}):
+            internal = gateway.build_internal_app()
+            prometheus = TestClient(internal, client=("172.31.250.2", 40000))
+            self.assertEqual(prometheus.get("/internal/elevation").status_code, 403)
+            refused = prometheus.post("/internal/elevation/request",
+                                      json={"level": "elevated", "minutes": 5})
+            self.assertEqual(refused.status_code, 403)
+            self.assertEqual(gateway.elevation.status()["pending"], [])
+            self.assertEqual(TestClient(internal, client=("10.9.3.4", 1)).get(
+                "/internal/elevation").status_code, 403)
+            # Other networks (executor, phone, host loopback) still work.
+            for host in ("172.20.0.3", "172.31.250.16", "127.0.0.1"):
+                self.assertEqual(TestClient(internal, client=(host, 40000)).get(
+                    "/internal/elevation").status_code, 200, host)
+
+        with mock.patch.dict(os.environ, {"INTERNAL_DENY_SUBNETS": ""}):
+            open_app = gateway.build_internal_app()
+        self.assertEqual(TestClient(open_app, client=("172.31.250.2", 1)).get(
+            "/internal/elevation").status_code, 200)
+
+    def test_client_denied_helper(self) -> None:
+        denied = gateway.parse_subnets("172.31.250.0/28")
+        self.assertTrue(gateway.client_denied("172.31.250.1", denied))
+        self.assertTrue(gateway.client_denied("::ffff:172.31.250.5", denied))
+        self.assertFalse(gateway.client_denied("172.31.250.17", denied))
+        self.assertFalse(gateway.client_denied(None, denied))
+        self.assertFalse(gateway.client_denied("172.31.250.1", []))
+        self.assertEqual(gateway.parse_subnets(" , "), [])
+        with self.assertRaises(ValueError):
+            gateway.parse_subnets("not-a-subnet")
 
 
 class ExecutorAgentTests(unittest.TestCase):

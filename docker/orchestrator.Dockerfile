@@ -12,6 +12,6 @@ COPY gateway.py elevation.py history.py log_buffer.py ./
 # volume works for whatever uid the container runs as). certs/ is mounted
 # at runtime (see docker-compose.yml) - never baked into the image.
 RUN mkdir -m 1777 /app/data
-# 8443: the mTLS gateway. 8001: elevation for the other services.
-EXPOSE 8443 8001
+# 8443: the mTLS gateway. 8001: elevation for the other services. 9100: metrics.
+EXPOSE 8443 8001 9100
 CMD ["python", "gateway.py"]

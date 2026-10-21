@@ -12,13 +12,20 @@
 #                SSH) and the phone service's tools.
 # phone        - the phone link (phone_service.py): the phone's WebSocket and
 #                the tools that drive it, nothing else.
-# prometheus   - scrapes the orchestrator's /metrics (internal port 8001)
-#                and keeps 30 days; UI on host loopback 127.0.0.1:9090.
+# prometheus   - scrapes only orchestrator:9100 (a metrics-only server:
+#                GET /metrics, nothing else) and keeps 30 days; UI on host
+#                loopback 127.0.0.1:9090.
 #
 # Networks: whisper talks only to the orchestrator (stt); the executor to
 # the orchestrator (exec, which also reaches the host and the internet for
 # Claude); the phone service only to those two (phonelink, internal);
-# prometheus only to the orchestrator (monitoring).
+# prometheus only to the orchestrator (monitoring, fixed subnet). The
+# orchestrator's internal port 8001 listens on all its networks, so it
+# refuses (403) clients from the monitoring subnet (INTERNAL_DENY_SUBNETS):
+# prometheus cannot reach /internal/elevation*. monitoring is not an
+# internal network - docker publishes no ports from a container whose only
+# network is internal, and the UI is published on 127.0.0.1:9090 - so
+# prometheus does have egress to the internet.
 #
 # Claude uses the same login as `claude` in your terminal: your ~/.claude is
 # mounted into the executor, which runs as your uid. Log in once on the
@@ -43,6 +50,12 @@ services:
       # Internal server: the elevation state for the executor, the phone
       # service and host/geba-root.
       INTERNAL_HOST: 0.0.0.0
+      # The monitoring network (prometheus) may not use the internal
+      # server; keep in sync with networks.monitoring below.
+      INTERNAL_DENY_SUBNETS: 172.31.250.0/28
+      # Metrics-only server (GET /metrics) for prometheus. Not published.
+      METRICS_HOST: 0.0.0.0
+      METRICS_PORT: "9100"
       DATA_DIR: /app/data
       # Optional PIN asked on the phone when approving a voice request to
       # lift the restrictions.
@@ -57,7 +70,17 @@ services:
       - orchestrator-data:/app/data
       # Tailed into the app's Logs screen.
       - ./command_audit.log:/app/command_audit.log:ro
-    networks: [default, stt, exec, phonelink, monitoring]
+    networks:
+      # default carries the published ports and the default route: the
+      # highest gw_priority keeps host connections to 127.0.0.1:8001 from
+      # arriving via the monitoring gateway (which INTERNAL_DENY_SUBNETS
+      # refuses).
+      default:
+        gw_priority: 100
+      stt:
+      exec:
+      phonelink:
+      monitoring:
     depends_on:
       whisper:
         condition: service_healthy
@@ -150,8 +173,17 @@ services:
       start_period: 10m  # first start downloads the Whisper model
 
   prometheus:
-    image: prom/prometheus:v3.5.0
+    # Multi-arch index digest of v3.5.0.
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
     restart: unless-stopped
+    # nobody, as in the image; the data volume must be writable by it.
+    user: "65534:65534"
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    mem_limit: 256m
+    pids_limit: 64
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -176,5 +208,9 @@ networks:
     internal: true
   # Only orchestrator and prometheus. Not internal: docker publishes no
   # ports from a container whose only network is internal, and the
-  # prometheus UI is published on host loopback.
+  # prometheus UI is published on host loopback. Fixed subnet: the
+  # orchestrator refuses it on its internal port (INTERNAL_DENY_SUBNETS).
   monitoring:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/28

@@ -33,6 +33,10 @@ loopback) carries the elevation state for the other services:
     GET  /internal/elevation           status (level, time left, pending)
     POST /internal/elevation/request   a request to lift the restrictions;
                                        granted only from the phone, here
+It refuses (403) clients from INTERNAL_DENY_SUBNETS (the monitoring
+network in docker-compose.yml).
+
+A third, plain-HTTP server (METRICS_PORT) serves only
     GET  /metrics                      Prometheus metrics (scraped by the
                                        prometheus service)
 
@@ -45,6 +49,7 @@ See README.md for the openssl commands to generate:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import secrets
@@ -58,7 +63,7 @@ import httpx
 import uvicorn
 import websockets
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Histogram, generate_latest
 from pydantic import BaseModel
 
@@ -75,6 +80,7 @@ AUDIT_LOG = Path(os.environ.get("AUDIT_LOG", BASE_DIR / "command_audit.log"))
 STT_URL = os.environ.get("STT_URL", "http://127.0.0.1:9000")
 STT_TIMEOUT = float(os.environ.get("STT_TIMEOUT", 60))
 INTERNAL_PORT = int(os.environ.get("INTERNAL_PORT", 8001))
+METRICS_PORT = int(os.environ.get("METRICS_PORT", 9100))
 
 # The agents tasks are handed to: name -> base URL. Each implements
 #   POST /task {"text", "request_id", "device_id"}
@@ -122,7 +128,7 @@ app = FastAPI(title="cluster-command-gateway", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# Metrics (served on the internal server, GET /metrics)
+# Metrics (served on their own server, METRICS_PORT, GET /metrics)
 # ---------------------------------------------------------------------------
 
 # From the request reaching a command handler to its final answer: for voice
@@ -526,14 +532,52 @@ class ElevationAsk(BaseModel):
     device_id: str = "unknown"
 
 
+def parse_subnets(spec: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """"172.31.250.0/28,10.0.0.0/8" -> networks. Empty = none. A malformed
+    entry raises: better not to start than to silently deny nothing."""
+    return [ipaddress.ip_network(part.strip(), strict=False)
+            for part in spec.split(",") if part.strip()]
+
+
+def client_denied(host: str | None, denied: list) -> bool:
+    if not denied or not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # not an IP (e.g. TestClient's "testclient")
+    if getattr(address, "ipv4_mapped", None):
+        address = address.ipv4_mapped
+    return any(address in net for net in denied)
+
+
+def build_metrics_app() -> FastAPI:
+    """Only GET /metrics, for prometheus. Everything else is a 404."""
+    metrics_app = FastAPI(title="orchestrator-metrics", docs_url=None,
+                          redoc_url=None, openapi_url=None)
+
+    @metrics_app.get("/metrics")
+    async def metrics():
+        return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
+
+    return metrics_app
+
+
 def build_internal_app() -> FastAPI:
     """Elevation for the other services: anyone here may read it or ask for
     it; only the phone (the mTLS API) can grant it."""
     internal = FastAPI(title="orchestrator-internal")
+    denied = parse_subnets(os.environ.get("INTERNAL_DENY_SUBNETS", ""))
 
-    @internal.get("/metrics")
-    async def metrics():
-        return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
+    @internal.middleware("http")
+    async def refuse_denied_subnets(request: Request, call_next):
+        # Port 8001 listens on every network of the container; the
+        # monitoring network (prometheus) must not reach it.
+        host = request.client.host if request.client else None
+        if client_denied(host, denied):
+            logger.warning("Internal server: refused %s (INTERNAL_DENY_SUBNETS)", host)
+            return JSONResponse({"detail": "Forbidden"}, status_code=403)
+        return await call_next(request)
 
     @internal.get("/internal/elevation")
     async def internal_elevation():
@@ -586,11 +630,19 @@ async def serve() -> None:
         port=INTERNAL_PORT,
         lifespan="on",
     ))
+    metrics = uvicorn.Server(uvicorn.Config(
+        build_metrics_app(),
+        host=os.environ.get("METRICS_HOST", "127.0.0.1"),
+        port=METRICS_PORT,
+        lifespan="off",
+    ))
+    servers = [public, internal, metrics]
     # Each server installs its own signal handlers, so a stop signal may
-    # reach only one of them: when either ends, end the other too.
-    tasks = [asyncio.create_task(public.serve()), asyncio.create_task(internal.serve())]
+    # reach only one of them: when any ends, end the others too.
+    tasks = [asyncio.create_task(server.serve()) for server in servers]
     await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    public.should_exit = internal.should_exit = True
+    for server in servers:
+        server.should_exit = True
     await asyncio.gather(*tasks)
 
 
