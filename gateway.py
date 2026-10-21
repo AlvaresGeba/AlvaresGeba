@@ -33,6 +33,8 @@ loopback) carries the elevation state for the other services:
     GET  /internal/elevation           status (level, time left, pending)
     POST /internal/elevation/request   a request to lift the restrictions;
                                        granted only from the phone, here
+    GET  /metrics                      Prometheus metrics (scraped by the
+                                       prometheus service)
 
 See README.md for the openssl commands to generate:
   ca.pem            - your private certificate authority
@@ -56,7 +58,8 @@ import httpx
 import uvicorn
 import websockets
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Histogram, generate_latest
 from pydantic import BaseModel
 
 from elevation import Elevation, ElevationError
@@ -116,6 +119,30 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="cluster-command-gateway", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Metrics (served on the internal server, GET /metrics)
+# ---------------------------------------------------------------------------
+
+# From the request reaching a command handler to its final answer: for voice
+# that includes reading the body, Whisper and the agent. Requests refused
+# before any processing (empty text, audio too large) are not observed.
+# The top bucket is AGENT_TIMEOUT's default.
+REQUEST_DURATION = Histogram(
+    "geba_request_duration_seconds",
+    "Time from a command reaching the orchestrator to its final answer.",
+    ["channel", "outcome"],  # channel: text|voice, outcome: ok|error
+    buckets=(1, 2, 5, 10, 20, 30, 60, 120, 180, 300, 330),
+)
+
+
+def reply_outcome(reply: dict) -> str:
+    """ok|error for the histogram: error when the pipeline failed (STT or
+    the agent raised, or the agent answered ERROR:). A REJECTED: answer is
+    the whitelist working as intended, so it counts as ok."""
+    failed = reply.get("error") or str(reply.get("result", "")).startswith("ERROR")
+    return "error" if failed else "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -195,10 +222,17 @@ async def receive_command(payload: CommandRequest):
     the TLS layer before this code even runs."""
     logger.info("Command from device=%s text=%r", payload.device_id, payload.text)
 
+    started = time.perf_counter()
     if not payload.text.strip():
         raise HTTPException(status_code=400, detail="Empty command text")
 
-    return await run_pipeline(payload.text.strip(), payload.device_id, "text")
+    outcome = "error"
+    try:
+        reply = await run_pipeline(payload.text.strip(), payload.device_id, "text")
+        outcome = reply_outcome(reply)
+        return reply
+    finally:
+        REQUEST_DURATION.labels(channel="text", outcome=outcome).observe(time.perf_counter() - started)
 
 
 # 10 s of 16 kHz / 16-bit mono PCM = 320 000 bytes. The watch records at most
@@ -237,6 +271,7 @@ async def receive_voice(request: Request, device_id: str = "unknown", lang: str 
     into text with Whisper and feeds that text into the same pipeline as
     /command. No `lang` = let Whisper detect the language (the app leaves
     it out when "auto" is chosen)."""
+    started = time.perf_counter()
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > MAX_VOICE_BYTES:
         raise HTTPException(status_code=413, detail="Audio too large")
@@ -245,6 +280,18 @@ async def receive_voice(request: Request, device_id: str = "unknown", lang: str 
     if len(pcm) > MAX_VOICE_BYTES:
         raise HTTPException(status_code=413, detail="Audio too large")
 
+    # From here on every exit is observed; anything raised is an error.
+    outcome = "error"
+    try:
+        reply = await _voice_pipeline(pcm, device_id, lang)
+        outcome = reply_outcome(reply)
+        return reply
+    finally:
+        REQUEST_DURATION.labels(channel="voice", outcome=outcome).observe(time.perf_counter() - started)
+
+
+async def _voice_pipeline(pcm: bytes, device_id: str, lang: str | None) -> dict:
+    """Whisper, then the same pipeline as /command."""
     try:
         text = await transcribe_audio(pcm, lang or "auto")
     except AudioRejected as exc:
@@ -483,6 +530,10 @@ def build_internal_app() -> FastAPI:
     """Elevation for the other services: anyone here may read it or ask for
     it; only the phone (the mTLS API) can grant it."""
     internal = FastAPI(title="orchestrator-internal")
+
+    @internal.get("/metrics")
+    async def metrics():
+        return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
     @internal.get("/internal/elevation")
     async def internal_elevation():

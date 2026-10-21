@@ -1,0 +1,10 @@
+# Prometheus for the orchestrator (see docker-compose.yml). One job: the
+# orchestrator's internal server, GET /metrics on port 8001.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: orchestrator
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["orchestrator:8001"]

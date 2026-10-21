@@ -277,6 +277,47 @@ class GatewayApiTests(unittest.TestCase):
             self.assertEqual(self.client.get("/agent/tools").json()["tools"], [])
 
 
+    def test_request_duration_metric(self) -> None:
+        def count(channel: str, outcome: str) -> float:
+            return gateway.REGISTRY.get_sample_value(
+                "geba_request_duration_seconds_count",
+                {"channel": channel, "outcome": outcome}) or 0.0
+
+        before = {key: count(*key) for key in
+                  [("text", "ok"), ("text", "error"), ("voice", "ok"), ("voice", "error")]}
+
+        ok = {"short": "OK: up", "detail": "OK: up", "steps": [], "needs_confirmation": False}
+        with mock.patch.object(gateway, "dispatch", mock.AsyncMock(return_value=ok)):
+            self.client.post("/command", json={"text": "uptime", "device_id": "pixel"})
+        self.assertEqual(count("text", "ok"), before["text", "ok"] + 1)
+
+        with mock.patch.object(gateway, "dispatch",
+                               mock.AsyncMock(side_effect=RuntimeError("executor: down"))):
+            reply = self.client.post("/command", json={"text": "uptime"}).json()
+        self.assertTrue(reply["result"].startswith("ERROR"))
+        self.assertEqual(count("text", "error"), before["text", "error"] + 1)
+
+        # Refused before processing: not observed at all.
+        self.assertEqual(self.client.post("/command", json={"text": "  "}).status_code, 400)
+        self.assertEqual(self.client.post("/voice", content=b"\0" * (gateway.MAX_VOICE_BYTES + 2),
+                                          headers={"content-type": "application/octet-stream"}
+                                          ).status_code, 413)
+        self.assertEqual(count("text", "ok"), before["text", "ok"] + 1)
+        self.assertEqual(count("text", "error"), before["text", "error"] + 1)
+        self.assertEqual(count("voice", "error"), before["voice", "error"])
+
+        # STT failing is a voice error.
+        with mock.patch.object(gateway, "transcribe_audio",
+                               mock.AsyncMock(side_effect=ConnectionError("whisper down"))):
+            self.assertEqual(self.client.post("/voice", content=b"\0" * 3200).status_code, 500)
+        self.assertEqual(count("voice", "error"), before["voice", "error"] + 1)
+
+        with mock.patch.object(gateway, "transcribe_audio", mock.AsyncMock(return_value="uptime")), \
+                mock.patch.object(gateway, "dispatch", mock.AsyncMock(return_value=ok)):
+            self.client.post("/command/audio", content=b"\0" * 3200)
+        self.assertEqual(count("voice", "ok"), before["voice", "ok"] + 1)
+
+
 class InternalServerTests(unittest.TestCase):
     def test_elevation_read_and_request(self) -> None:
         with mock.patch.object(gateway, "elevation", Elevation()):
@@ -290,6 +331,12 @@ class InternalServerTests(unittest.TestCase):
             self.assertEqual((status["level"], status["pending"][0]["code"]), ("normal", asked["code"]))
             bad = client.post("/internal/elevation/request", json={"level": "root", "minutes": 5}).json()
             self.assertFalse(bad["ok"])
+
+    def test_metrics_only_on_the_internal_server(self) -> None:
+        response = TestClient(gateway.build_internal_app()).get("/metrics")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("geba_request_duration_seconds", response.text)
+        self.assertEqual(TestClient(gateway.app).get("/metrics").status_code, 404)
 
 
 class ExecutorAgentTests(unittest.TestCase):

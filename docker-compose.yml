@@ -12,10 +12,13 @@
 #                SSH) and the phone service's tools.
 # phone        - the phone link (phone_service.py): the phone's WebSocket and
 #                the tools that drive it, nothing else.
+# prometheus   - scrapes the orchestrator's /metrics (internal port 8001)
+#                and keeps 30 days; UI on host loopback 127.0.0.1:9090.
 #
 # Networks: whisper talks only to the orchestrator (stt); the executor to
 # the orchestrator (exec, which also reaches the host and the internet for
-# Claude); the phone service only to those two (phonelink, internal).
+# Claude); the phone service only to those two (phonelink, internal);
+# prometheus only to the orchestrator (monitoring).
 #
 # Claude uses the same login as `claude` in your terminal: your ~/.claude is
 # mounted into the executor, which runs as your uid. Log in once on the
@@ -54,7 +57,7 @@ services:
       - orchestrator-data:/app/data
       # Tailed into the app's Logs screen.
       - ./command_audit.log:/app/command_audit.log:ro
-    networks: [default, stt, exec, phonelink]
+    networks: [default, stt, exec, phonelink, monitoring]
     depends_on:
       whisper:
         condition: service_healthy
@@ -146,12 +149,32 @@ services:
       retries: 3
       start_period: 10m  # first start downloads the Whisper model
 
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      # Host loopback only.
+      - "127.0.0.1:9090:9090"
+    networks: [monitoring]
+
 volumes:
   whisper-models:
   orchestrator-data:
+  prometheus-data:
 
 networks:
   stt:
   exec:
   phonelink:
     internal: true
+  # Only orchestrator and prometheus. Not internal: docker publishes no
+  # ports from a container whose only network is internal, and the
+  # prometheus UI is published on host loopback.
+  monitoring:
