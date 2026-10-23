@@ -223,8 +223,31 @@ def build_phone_mcp(hub: PhoneHub, elevation_level: Callable[[], str],
         """Battery, charging, screen on/locked, foreground app, volume, DND,
         and whether accessibility / notification access are granted. Cheap -
         call it first when unsure what state the phone is in.
+        read_screen, tap, type_text, scroll, press_key, open_app and open_url
+        unlock a locked phone themselves. If one fails because the phone is
+        locked, call this: the error says why (no saved PIN, accessibility
+        off, too many failed attempts, first unlock after a reboot) - those
+        need the user to unlock the phone by hand.
         device_id: which phone; empty = the most recently connected one."""
         return await run("status", None, device_id)
+
+    @mcp.tool()
+    async def phone_wake(device_id: str = "") -> dict:
+        """Turn the screen on. Does not unlock."""
+        return await run("wake", None, device_id)
+
+    @mcp.tool()
+    async def phone_unlock(device_id: str = "") -> dict:
+        """Turn the screen on and unlock the phone (the phone enters its own
+        saved PIN; takes up to ~6 s). UI tools already unlock by themselves -
+        call this only when the user asks or a tool reported the lock."""
+        return await run("unlock", None, device_id)
+
+    @mcp.tool()
+    async def phone_keep_awake(seconds: int = 300, device_id: str = "") -> dict:
+        """Keep the screen from turning off for this many seconds (max 1800);
+        0 releases the hold."""
+        return await run("keep_awake", {"seconds": seconds}, device_id)
 
     @mcp.tool()
     async def read_screen(max_nodes: int = 80, device_id: str = "") -> dict:
@@ -257,7 +280,8 @@ def build_phone_mcp(hub: PhoneHub, elevation_level: Callable[[], str],
     @mcp.tool()
     async def press_key(key: str, device_id: str = "") -> dict:
         """System key: back, home, recents, notifications, quick_settings,
-        power_dialog, lock_screen."""
+        power_dialog, lock_screen (lock_screen locks; the others unlock
+        first if needed)."""
         return await run("global", {"key": key}, device_id)
 
     @mcp.tool()

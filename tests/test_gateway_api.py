@@ -171,6 +171,32 @@ class PhoneHubTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_wake_unlock_keep_awake_tools(self) -> None:
+        async def scenario():
+            hub = PhoneHub()
+            mcp = phone_hub.build_phone_mcp(hub, lambda: "normal")  # no elevation needed
+            ws = FakeSocket("pixel", lambda m: {"ok": True, "result": m["action"]})
+            serving = asyncio.create_task(hub.serve(ws))
+            await asyncio.sleep(0.01)
+
+            async def use(tool, args):
+                result = await mcp.call_tool(tool, args)
+                content = result[0] if isinstance(result, tuple) else result
+                return json.loads(content[0].text)
+
+            self.assertEqual(await use("phone_wake", {}), {"ok": True, "result": "wake"})
+            self.assertEqual(await use("phone_unlock", {}), {"ok": True, "result": "unlock"})
+            self.assertTrue((await use("phone_keep_awake", {}))["ok"])
+            self.assertTrue((await use("phone_keep_awake", {"seconds": 0}))["ok"])
+            sent = [(m["action"], {k: v for k, v in m["args"].items() if k != "deny_packages"})
+                    for m in ws.sent]
+            self.assertEqual(sent, [("wake", {}), ("unlock", {}), ("keep_awake", {"seconds": 300}),
+                                    ("keep_awake", {"seconds": 0})])
+            ws.incoming.put_nowait(None)
+            await serving
+
+        asyncio.run(scenario())
+
 
 class GatewayApiTests(unittest.TestCase):
     def setUp(self) -> None:
