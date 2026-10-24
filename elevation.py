@@ -151,9 +151,9 @@ class Elevation:
             self._expire(now)
             challenge = self._pending.get(challenge_id)
             if challenge is None:
-                raise ElevationError("Запрос не найден или истёк")
+                raise ElevationError("Request not found or expired")
             if ELEVATION_PIN and not hmac.compare_digest((pin or "").encode(), ELEVATION_PIN.encode()):
-                raise ElevationError("Неверный PIN")
+                raise ElevationError("Wrong PIN")
             del self._pending[challenge_id]
             self._grant(challenge.level, challenge.ttl_s, confirmed_by, challenge.reason, now)
             return challenge

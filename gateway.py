@@ -381,7 +381,7 @@ async def elevation_confirm(body: ElevationId):
         return {"ok": False, "error": str(exc)}
     logger.warning("Restrictions lifted: level=%s for %ss (code %s, asked by %s)",
                    challenge.level, challenge.ttl_s, challenge.code, challenge.device_id)
-    return {"ok": True, "message": f"{challenge.level} на {challenge.ttl_s // 60} мин"}
+    return {"ok": True, "message": f"{challenge.level} for {challenge.ttl_s // 60} min"}
 
 
 @app.post("/elevation/deny")
