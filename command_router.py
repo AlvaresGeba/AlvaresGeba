@@ -99,7 +99,9 @@ line (max ~60 characters) starting with exactly one of:
   REJECTED: <reason>          - the server or phone refused
   ERROR: <what went wrong>    - anything else
 After that you may add a blank line and a fuller answer (plain text, no
-markdown) - the phone app shows it in full. Reply in the user's language.
+markdown) - the phone app shows it in full. Always reply in English, even
+when the user speaks another language (non-ASCII text breaks the watch
+reply labels).
 """
 
 
