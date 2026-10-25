@@ -1,0 +1,13 @@
+# Dashboards come from git (monitoring/grafana/dashboards, mounted read-only
+# at /etc/grafana/dashboards). Edit the JSON, not the UI.
+apiVersion: 1
+
+providers:
+  - name: geba
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

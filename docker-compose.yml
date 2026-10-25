@@ -15,17 +15,24 @@
 # prometheus   - scrapes only orchestrator:9100 (a metrics-only server:
 #                GET /metrics, nothing else) and keeps 30 days; UI on host
 #                loopback 127.0.0.1:9090.
+# grafana      - dashboards over prometheus' data (provisioned from
+#                monitoring/grafana, read-only); UI on host loopback
+#                127.0.0.1:3000, admin login from GRAFANA_ADMIN_PASSWORD.
 #
 # Networks: whisper talks only to the orchestrator (stt); the executor to
 # the orchestrator (exec, which also reaches the host and the internet for
 # Claude); the phone service only to those two (phonelink, internal);
-# prometheus only to the orchestrator (monitoring, fixed subnet). The
-# orchestrator's internal port 8001 listens on all its networks, so it
-# refuses (403) clients from the monitoring subnet (INTERNAL_DENY_SUBNETS):
-# prometheus cannot reach /internal/elevation*. monitoring is not an
-# internal network - docker publishes no ports from a container whose only
-# network is internal, and the UI is published on 127.0.0.1:9090 - so
-# prometheus does have egress to the internet.
+# prometheus to the orchestrator (monitoring, fixed subnet) and to grafana
+# (grafana). The orchestrator's internal port 8001 listens on all its
+# networks, so it refuses (403) clients from the monitoring subnet
+# (INTERNAL_DENY_SUBNETS): prometheus cannot reach /internal/elevation*.
+# monitoring is not an internal network - docker publishes no ports from a
+# container whose only network is internal, and the UI is published on
+# 127.0.0.1:9090 - so prometheus does have egress to the internet. grafana
+# talks only to prometheus (grafana network) and never joins monitoring, so
+# it cannot reach the orchestrator. grafana is not internal either (its UI
+# is published on 127.0.0.1:3000), so it has egress to the internet; update
+# checks, plugin preinstall, news and telemetry are switched off.
 #
 # Claude uses the same login as `claude` in your terminal: your ~/.claude is
 # mounted into the executor, which runs as your uid. Log in once on the
@@ -194,12 +201,57 @@ services:
     ports:
       # Host loopback only.
       - "127.0.0.1:9090:9090"
-    networks: [monitoring]
+    # monitoring: scrapes the orchestrator; grafana: queried by grafana
+    # only. Its address on grafana is outside INTERNAL_DENY_SUBNETS, but
+    # the orchestrator is not on that network, so it cannot use it.
+    networks: [monitoring, grafana]
+
+  grafana:
+    # Multi-arch index digest of 12.0.2.
+    image: grafana/grafana-oss:12.0.2@sha256:b5b59bfc7561634c2d7b136c4543d702ebcc94a3da477f21ff26f89ffd4214fa
+    restart: unless-stopped
+    # grafana, as in the image; the data volume must be writable by it.
+    user: "472:472"
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    mem_limit: 512m
+    pids_limit: 128
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # No background plugin downloads (Grafana 12 preinstalls some apps).
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      # Read-only rootfs: everything writable lives in the data volume
+      # (or /tmp); logs go to stdout only.
+      GF_PATHS_DATA: /var/lib/grafana
+      GF_PATHS_LOGS: /var/lib/grafana/logs
+      GF_PATHS_PLUGINS: /var/lib/grafana/plugins
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      GF_LOG_MODE: console
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Outside the data volume; see provisioning/dashboards/geba.yml.
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      # Host loopback only.
+      - "127.0.0.1:3000:3000"
+    networks: [grafana]
+    depends_on: [prometheus]
 
 volumes:
   whisper-models:
   orchestrator-data:
   prometheus-data:
+  grafana-data:
 
 networks:
   stt:
@@ -214,3 +266,8 @@ networks:
     ipam:
       config:
         - subnet: 172.31.250.0/28
+  # Only grafana and prometheus (never the orchestrator). Not internal, for
+  # the same reason as monitoring: the grafana UI is published on host
+  # loopback; so grafana has internet egress (update checks and telemetry
+  # are disabled in its environment).
+  grafana:

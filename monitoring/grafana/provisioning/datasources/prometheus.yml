@@ -1,0 +1,14 @@
+# The only datasource: prometheus on the grafana network. The fixed uid is
+# referenced by dashboards/geba.json.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
