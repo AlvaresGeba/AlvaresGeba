@@ -19,6 +19,11 @@ only to Prometheus and cannot reach the orchestrator.
    GRAFANA_ADMIN_PASSWORD=<a long random password>
    ```
 
+   Grafana reads it only when its database is first created. To change it
+   later, use the UI or
+   `docker compose exec grafana grafana cli admin reset-admin-password <new>`;
+   editing `.env` alone does nothing.
+
 2. Start both:
 
    ```

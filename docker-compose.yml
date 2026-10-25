@@ -229,6 +229,17 @@ services:
       GF_NEWS_NEWS_FEED_ENABLED: "false"
       # No background plugin downloads (Grafana 12 preinstalls some apps).
       GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      # Grafana has internet egress: no plugin installs from the UI, no
+      # datasource proxying beyond prometheus, nothing published outside.
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
+      GF_SECURITY_DATA_SOURCE_PROXY_WHITELIST: "prometheus:9090"
+      GF_SNAPSHOTS_ENABLED: "false"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
+      GF_PUBLIC_DASHBOARDS_ENABLED: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      # Reached through an SSH tunnel on localhost.
+      GF_SERVER_ROOT_URL: http://localhost:3000/
+      GF_SECURITY_COOKIE_SAMESITE: strict
       # Read-only rootfs: everything writable lives in the data volume
       # (or /tmp); logs go to stdout only.
       GF_PATHS_DATA: /var/lib/grafana
