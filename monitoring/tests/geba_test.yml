@@ -1,0 +1,200 @@
+# Unit tests for geba.yml:
+#   promtool test rules monitoring/tests/geba_test.yml
+# Kept out of monitoring/rules: prometheus loads rules/*.yml, and this is
+# not a rule file.
+# One sample every 15 s (the scrape interval), so "0x20" covers 5 minutes.
+rule_files:
+  - ../rules/geba.yml
+
+evaluation_interval: 15s
+
+tests:
+  # A 70 s text request lands at 5m15s: counted in le="+Inf", not in le="60.0".
+  - interval: 15s
+    input_series:
+      - series: 'geba_request_duration_seconds_bucket{job="orchestrator", instance="orchestrator:9100", channel="text", outcome="ok", le="60.0"}'
+        values: '0x80'
+      - series: 'geba_request_duration_seconds_bucket{job="orchestrator", instance="orchestrator:9100", channel="text", outcome="ok", le="300.0"}'
+        values: '0x20 1x60'
+      - series: 'geba_request_duration_seconds_bucket{job="orchestrator", instance="orchestrator:9100", channel="text", outcome="ok", le="+Inf"}'
+        values: '0x20 1x60'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SlowRequest
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: SlowRequest
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              channel: text
+              outcome: ok
+            exp_annotations:
+              summary: "Request over 60 s (text, ok)"
+              description: "About 1 text request(s) with outcome ok took longer than 60 s in the last 5 minutes. See the orchestrator history (took_ms) for the exact commands and durations."
+      # Out of the 5 m window, still held by keep_firing_for (10 m); the
+      # annotation keeps the last value.
+      - eval_time: 14m
+        alertname: SlowRequest
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              channel: text
+              outcome: ok
+            exp_annotations:
+              summary: "Request over 60 s (text, ok)"
+              description: "About 1 text request(s) with outcome ok took longer than 60 s in the last 5 minutes. See the orchestrator history (took_ms) for the exact commands and durations."
+      # Leaves the 5 m window at ~10m, released ~10 m later.
+      - eval_time: 19m
+        alertname: SlowRequest
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              channel: text
+              outcome: ok
+            exp_annotations:
+              summary: "Request over 60 s (text, ok)"
+              description: "About 1 text request(s) with outcome ok took longer than 60 s in the last 5 minutes. See the orchestrator history (took_ms) for the exact commands and durations."
+      - eval_time: 22m
+        alertname: SlowRequest
+        exp_alerts: []
+      # 70 s is under 300 s.
+      - eval_time: 6m
+        alertname: RequestNearTimeout
+        exp_alerts: []
+
+  # A 50 s request: both le="60.0" and le="+Inf" increase.
+  - interval: 15s
+    input_series:
+      - series: 'geba_request_duration_seconds_bucket{job="orchestrator", instance="orchestrator:9100", channel="voice", outcome="ok", le="60.0"}'
+        values: '0x20 1x40'
+      - series: 'geba_request_duration_seconds_bucket{job="orchestrator", instance="orchestrator:9100", channel="voice", outcome="ok", le="+Inf"}'
+        values: '0x20 1x40'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: SlowRequest
+        exp_alerts: []
+
+  # First request ever for (voice, error) is a 310 s one: the series appears
+  # with value 1, so increase() alone would miss it.
+  - interval: 15s
+    input_series:
+      - series: 'geba_request_duration_seconds_bucket{job="orchestrator", instance="orchestrator:9100", channel="voice", outcome="error", le="60.0"}'
+        values: '_x20 0x40'
+      - series: 'geba_request_duration_seconds_bucket{job="orchestrator", instance="orchestrator:9100", channel="voice", outcome="error", le="300.0"}'
+        values: '_x20 0x40'
+      - series: 'geba_request_duration_seconds_bucket{job="orchestrator", instance="orchestrator:9100", channel="voice", outcome="error", le="+Inf"}'
+        values: '_x20 1x40'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: RequestNearTimeout
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              channel: voice
+              outcome: error
+            exp_annotations:
+              summary: "Request over 300 s, near the agent timeout (voice, error)"
+              description: "About 1 voice request(s) with outcome error took longer than 300 s in the last 5 minutes (AGENT_TIMEOUT defaults to 330 s). See the orchestrator history (took_ms) and the executor logs."
+      - eval_time: 6m
+        alertname: SlowRequest
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              channel: voice
+              outcome: error
+            exp_annotations:
+              summary: "Request over 60 s (voice, error)"
+              description: "About 1 voice request(s) with outcome error took longer than 60 s in the last 5 minutes. See the orchestrator history (took_ms) for the exact commands and durations."
+
+  # Scrape fails from 1m on.
+  - interval: 15s
+    input_series:
+      - series: 'up{job="orchestrator", instance="orchestrator:9100"}'
+        values: '1x3 0x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: OrchestratorDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: OrchestratorDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: orchestrator
+              instance: orchestrator:9100
+            exp_annotations:
+              summary: "Orchestrator metrics endpoint is down"
+              description: "Prometheus has failed to scrape orchestrator:9100 for more than 2 minutes. The orchestrator container is probably stopped, restarting or hung."
+      - eval_time: 4m
+        alertname: OrchestratorMetricsAbsent
+        exp_alerts: []
+
+  # No up series at all.
+  - interval: 15s
+    input_series:
+      - series: 'up{job="other"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: OrchestratorMetricsAbsent
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OrchestratorMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: orchestrator
+            exp_annotations:
+              summary: "No scrape data for job orchestrator"
+              description: "Prometheus has no up{job=\"orchestrator\"} series for 5 minutes: the scrape job is missing from prometheus.yml or the target cannot be resolved."
+
+  # 1 error out of 1 request: ratio 100 % but below the 3-request guard.
+  - interval: 15s
+    input_series:
+      - series: 'geba_request_duration_seconds_count{job="orchestrator", instance="orchestrator:9100", channel="text", outcome="ok"}'
+        values: '0x80'
+      - series: 'geba_request_duration_seconds_count{job="orchestrator", instance="orchestrator:9100", channel="text", outcome="error"}'
+        values: '0x20 1x60'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HighErrorRatio
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ErrorBurst
+        exp_alerts: []
+
+  # 4 errors out of 10 at 5m15s: 40 % over >= 3 requests, firing after 5 m.
+  # 2 errors on voice: no burst; 4 on text: burst.
+  - interval: 15s
+    input_series:
+      - series: 'geba_request_duration_seconds_count{job="orchestrator", instance="orchestrator:9100", channel="text", outcome="ok"}'
+        values: '0x20 6x60'
+      - series: 'geba_request_duration_seconds_count{job="orchestrator", instance="orchestrator:9100", channel="text", outcome="error"}'
+        values: '0x20 4x60'
+      - series: 'geba_request_duration_seconds_count{job="orchestrator", instance="orchestrator:9100", channel="voice", outcome="ok"}'
+        values: '0x20 8x60'
+      - series: 'geba_request_duration_seconds_count{job="orchestrator", instance="orchestrator:9100", channel="voice", outcome="error"}'
+        values: '0x20 2x60'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: HighErrorRatio
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: HighErrorRatio
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              channel: text
+            exp_annotations:
+              summary: "High error ratio on text"
+              description: "40% of text requests failed over the last 15 minutes (threshold 20%, at least 3 requests). See the orchestrator history and logs."
+      - eval_time: 6m
+        alertname: ErrorBurst
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              channel: text
+            exp_annotations:
+              summary: "Burst of errors on text"
+              description: "About 4 text requests failed in the last 10 minutes. See the orchestrator history and logs."

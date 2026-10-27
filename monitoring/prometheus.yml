@@ -3,6 +3,16 @@
 # internal port 8001 refuses the monitoring network).
 global:
   scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alerting rules (monitoring/rules, mounted read-only). Reload after an edit
+# with `docker compose kill -s HUP prometheus`.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+# No `alerting:` block on purpose: there is no Alertmanager and nothing
+# sends notifications. Alerts are viewed in the Prometheus UI (Alerts page)
+# and in Grafana (Alerting > Alert rules, and the "Alerts" dashboard row).
 
 scrape_configs:
   - job_name: orchestrator

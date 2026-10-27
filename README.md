@@ -45,3 +45,35 @@ read-only). UI edits cannot be saved: edit `monitoring/grafana/dashboards/*.json
 instead (Grafana picks up changes within 30 s). The "Geba gateway" dashboard
 shows request latency (p50/p95) and rate by channel and outcome, the error
 ratio, and the orchestrator's memory and CPU.
+
+### Alerts
+
+Prometheus evaluates the alerting rules in `monitoring/rules/geba.yml`
+(mounted read-only at `/etc/prometheus/rules`): slow requests (> 60 s and
+> 300 s), orchestrator down or missing, high error ratio, error bursts, high
+p95 latency, restarts, and high memory or CPU. There is no Alertmanager and
+nothing sends notifications by design: alerts are only shown in the
+Prometheus UI (http://localhost:9090/alerts through an SSH tunnel), in
+Grafana under Alerting > Alert rules ("Data source-managed", read-only),
+and in the "Alerts" row of the Geba gateway dashboard. For slow requests,
+look up the commands and their `took_ms` in the orchestrator history.
+
+Check the config, the rules and the rule unit tests
+(`monitoring/tests/geba_test.yml`) with promtool from the pinned image,
+without starting the stack:
+
+```
+IMG=$(docker compose config --images prometheus)
+docker run --rm --entrypoint promtool \
+  -v "$PWD/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+  -v "$PWD/monitoring/rules:/etc/prometheus/rules:ro" \
+  "$IMG" check config /etc/prometheus/prometheus.yml
+docker run --rm --entrypoint promtool -v "$PWD/monitoring:/m:ro" \
+  "$IMG" test rules /m/tests/geba_test.yml
+```
+
+After editing the rules, reload Prometheus without a restart:
+
+```
+docker compose kill -s HUP prometheus
+```

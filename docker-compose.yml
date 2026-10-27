@@ -13,8 +13,10 @@
 # phone        - the phone link (phone_service.py): the phone's WebSocket and
 #                the tools that drive it, nothing else.
 # prometheus   - scrapes only orchestrator:9100 (a metrics-only server:
-#                GET /metrics, nothing else) and keeps 30 days; UI on host
-#                loopback 127.0.0.1:9090.
+#                GET /metrics, nothing else) and keeps 30 days; evaluates
+#                the alerting rules in monitoring/rules (no Alertmanager,
+#                no notifications: alerts are only shown in its UI and in
+#                grafana); UI on host loopback 127.0.0.1:9090.
 # grafana      - dashboards over prometheus' data (provisioned from
 #                monitoring/grafana, read-only); UI on host loopback
 #                127.0.0.1:3000, admin login from GRAFANA_ADMIN_PASSWORD.
@@ -197,6 +199,8 @@ services:
       - --storage.tsdb.retention.time=30d
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Alerting rules; reload with `docker compose kill -s HUP prometheus`.
+      - ./monitoring/rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     ports:
       # Host loopback only.

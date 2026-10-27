@@ -1,0 +1,214 @@
+# Alerting rules for the orchestrator (job "orchestrator", see
+# ../prometheus.yml). There is no Alertmanager: alerts are only viewed in the
+# Prometheus UI (Alerts page) and in Grafana (Alerting > Alert rules,
+# "Data source-managed", and the "Alerts" row of the Geba gateway dashboard).
+# Nothing sends notifications.
+#
+# Check:  promtool check rules monitoring/rules/geba.yml
+#         promtool test rules monitoring/tests/geba_test.yml
+# Reload: docker compose kill -s HUP prometheus
+#
+# Notes that apply to several rules below:
+#
+# * geba_request_duration_seconds is a histogram with buckets
+#   1,2,5,10,20,30,60,120,180,300,330 (le="60.0", le="+Inf", ...), labelled
+#   channel=text|voice and outcome=ok|error.
+#
+# * increase() extrapolates to the edges of the range, so one request can
+#   show up as 1.03 and two as up to ~2.2 (more when a series has only a few
+#   samples in the range). Count thresholds "at least N" are therefore
+#   written as "> N - 0.5": 2 requests stay below 2.5 for any realistic
+#   extrapolation, and 3 requests are never below 3 (extrapolation only
+#   enlarges the raw delta). This is the same as "round(x) >= N" but keeps
+#   the unrounded value in $value. "Any" checks stay "> 0": one request is
+#   at least 1, and the two increase() terms of a bucket difference share
+#   the same samples and extrapolation factor, so no request gives exactly 0.
+#
+# * The gateway creates a (channel, outcome) series only on the first
+#   request with that combination (the labels are not pre-initialised), so
+#   increase() cannot see that first request: a series appearing with value
+#   1 has no earlier sample to compare to. The single-event alerts
+#   (SlowRequest, RequestNearTimeout, ErrorBurst) therefore also count the
+#   current value of series that did not exist 5 m earlier ("new series"
+#   term, placed left of "or" so it wins over increase() for the same
+#   labels). Ratio and p95 alerts need several requests anyway and do not
+#   bother. A restart is not affected: the old series is still within the
+#   range, and increase() treats the drop to the new value as a counter
+#   reset and counts it.
+#
+# * Ratios and quantiles are NaN with zero traffic. NaN compares false, so
+#   such series never fire; the ">= 3 requests" guards also keep one-off
+#   errors and single slow requests from driving the ratio/p95 alerts.
+groups:
+  - name: geba
+    # Same as global.evaluation_interval; stated so the group does not
+    # silently change if the global value does.
+    interval: 15s
+    rules:
+      - alert: SlowRequest
+        expr: |
+          sum by (channel, outcome) (
+              (
+                  geba_request_duration_seconds_bucket{le="+Inf"}
+                - ignoring (le)
+                  geba_request_duration_seconds_bucket{le="60.0"}
+              )
+              unless on (job, instance, channel, outcome)
+                geba_request_duration_seconds_bucket{le="+Inf"} offset 5m
+            or
+                increase(geba_request_duration_seconds_bucket{le="+Inf"}[5m])
+              - ignoring (le)
+                increase(geba_request_duration_seconds_bucket{le="60.0"}[5m])
+          ) > 0
+        # Fires on the first evaluation that sees the request; held for 10 m
+        # so that a single slow request does not flash by unnoticed.
+        keep_firing_for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Request over 60 s ({{ $labels.channel }}, {{ $labels.outcome }})"
+          description: >-
+            About {{ $value | printf "%.0f" }} {{ $labels.channel }} request(s)
+            with outcome {{ $labels.outcome }} took longer than 60 s in the
+            last 5 minutes. See the orchestrator history (took_ms) for the
+            exact commands and durations.
+
+      - alert: RequestNearTimeout
+        expr: |
+          sum by (channel, outcome) (
+              (
+                  geba_request_duration_seconds_bucket{le="+Inf"}
+                - ignoring (le)
+                  geba_request_duration_seconds_bucket{le="300.0"}
+              )
+              unless on (job, instance, channel, outcome)
+                geba_request_duration_seconds_bucket{le="+Inf"} offset 5m
+            or
+                increase(geba_request_duration_seconds_bucket{le="+Inf"}[5m])
+              - ignoring (le)
+                increase(geba_request_duration_seconds_bucket{le="300.0"}[5m])
+          ) > 0
+        keep_firing_for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Request over 300 s, near the agent timeout ({{ $labels.channel }}, {{ $labels.outcome }})"
+          description: >-
+            About {{ $value | printf "%.0f" }} {{ $labels.channel }} request(s)
+            with outcome {{ $labels.outcome }} took longer than 300 s in the
+            last 5 minutes (AGENT_TIMEOUT defaults to 330 s). See the
+            orchestrator history (took_ms) and the executor logs.
+
+      - alert: OrchestratorDown
+        expr: up{job="orchestrator"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Orchestrator metrics endpoint is down"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for more
+            than 2 minutes. The orchestrator container is probably stopped,
+            restarting or hung.
+
+      - alert: OrchestratorMetricsAbsent
+        expr: absent(up{job="orchestrator"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No scrape data for job orchestrator"
+          description: >-
+            Prometheus has no up{job="orchestrator"} series for 5 minutes:
+            the scrape job is missing from prometheus.yml or the target
+            cannot be resolved.
+
+      - alert: HighErrorRatio
+        expr: |
+          (
+              sum by (channel) (increase(geba_request_duration_seconds_count{outcome="error"}[15m]))
+            /
+              sum by (channel) (increase(geba_request_duration_seconds_count[15m]))
+          ) > 0.2
+          and on (channel)
+          sum by (channel) (increase(geba_request_duration_seconds_count[15m])) > 2.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error ratio on {{ $labels.channel }}"
+          description: >-
+            {{ $value | humanizePercentage }} of {{ $labels.channel }} requests
+            failed over the last 15 minutes (threshold 20%, at least 3
+            requests). See the orchestrator history and logs.
+
+      - alert: ErrorBurst
+        expr: |
+          sum by (channel) (
+              geba_request_duration_seconds_count{outcome="error"}
+              unless on (job, instance, channel, outcome)
+                geba_request_duration_seconds_count{outcome="error"} offset 10m
+            or
+              increase(geba_request_duration_seconds_count{outcome="error"}[10m])
+          ) > 2.5
+        labels:
+          severity: warning
+        annotations:
+          summary: "Burst of errors on {{ $labels.channel }}"
+          description: >-
+            About {{ $value | printf "%.0f" }} {{ $labels.channel }} requests
+            failed in the last 10 minutes. See the orchestrator history and
+            logs.
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (channel, le) (increase(geba_request_duration_seconds_bucket[30m]))
+          ) > 30
+          and on (channel)
+          sum by (channel) (increase(geba_request_duration_seconds_count[30m])) > 2.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High p95 latency on {{ $labels.channel }}"
+          description: >-
+            The 95th percentile of {{ $labels.channel }} request duration over
+            the last 30 minutes is {{ $value | humanizeDuration }} (threshold
+            30 s, at least 3 requests). Bucket interpolation makes this
+            approximate.
+
+      - alert: OrchestratorRestarted
+        expr: changes(process_start_time_seconds{job="orchestrator"}[15m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Orchestrator restarted"
+          description: >-
+            The orchestrator process on {{ $labels.instance }} started
+            {{ $value | printf "%.0f" }} time(s) in the last 15 minutes.
+
+      - alert: OrchestratorHighMemory
+        # 1 GiB. The container has no mem_limit, so this is the only guard.
+        expr: process_resident_memory_bytes{job="orchestrator"} > 1073741824
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Orchestrator resident memory above 1 GiB"
+          description: >-
+            The orchestrator on {{ $labels.instance }} uses
+            {{ $value | humanize1024 }}B of resident memory (threshold 1 GiB,
+            for 10 minutes). The container has no memory limit.
+
+      - alert: OrchestratorHighCPU
+        expr: rate(process_cpu_seconds_total{job="orchestrator"}[5m]) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Orchestrator CPU above 90% of one core"
+          description: >-
+            The orchestrator on {{ $labels.instance }} uses
+            {{ $value | humanizePercentage }} of one CPU core (5 m rate,
+            for 10 minutes). It runs no model, so this suggests a busy loop.

@@ -12,3 +12,10 @@ datasources:
     editable: false
     jsonData:
       timeInterval: 15s
+      # List prometheus' own alerting rules (monitoring/rules) under
+      # Alerting > Alert rules as data source-managed rules. They are
+      # read-only there: Prometheus has no ruler API, rules are edited in
+      # git.
+      manageAlerts: true
+      prometheusType: Prometheus
+      prometheusVersion: 3.5.0
